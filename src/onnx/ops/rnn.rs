@@ -10,7 +10,7 @@ use crate::onnx::builder_helpers::{
     i64_slice_to_mldim, map_op_result, output_label, record_node_output, reshape_with_shape,
     slice_with_params,
 };
-use crate::onnx::convert::OnnxError;
+use crate::onnx::convert::{sanitize_identifier, OnnxError};
 use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
 use crate::protos::onnx::NodeProto;
 use rustnn::mlcontext::MLOperand;
@@ -34,8 +34,11 @@ impl OpHandler for RnnHandler {
         b: &mut OnnxBuilder<'_, '_, '_>,
     ) -> Result<ConversionResult, OnnxError> {
         let op_type = node.op_type.as_str();
+        // Sanitized: it seeds operand labels, which become MIL value names in the
+        // CoreML backend (raw ONNX names like `/lstm/LSTM` contain `/`, which the
+        // MIL parser rejects).
         let node_name = if !node.name.is_empty() {
-            node.name.clone()
+            sanitize_identifier(&node.name)
         } else {
             "unnamed".to_string()
         };

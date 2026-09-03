@@ -33,7 +33,7 @@
   {"file": "Mozilla--distilvit/onnx/encoder_model.onnx", "override_dims": {"batch_size": 1, "num_channels": 3, "height": 224, "width": 224}},
   {"file": "Mozilla--distilvit/onnx/decoder_model.onnx", "override_dims": {"batch_size": 1, "decoder_sequence_length": 16, "encoder_sequence_length": 197}},
   {"file": "prithivMLmods--Common-Voice-Gender-Detection-ONNX/onnx/model.onnx", "override_dims": {"batch_size": 1, "num_samples": 16000, "sequence_length": 16000}},
-  {"file": "Xenova--donut-base-finetuned-docvqa/onnx/encoder_model_quantized.onnx", "override_dims": {"batch_size": 1, "num_channels": 3, "height": 2560, "width": 1920}},
+  {"file": "Xenova--donut-base-finetuned-docvqa/onnx/encoder_model_quantized.onnx", "override_dims": {"batch_size": 1, "num_channels": 3, "height": 2560, "width": 1920}, "coreml_unsupported": "Swin window partitioning uses rank-6 reshapes; CoreML MIL caps tensor rank at 5"},
   {"file": "Xenova--donut-base-finetuned-docvqa/onnx/decoder_model_quantized.onnx", "override_dims": {"batch_size": 1, "decoder_sequence_length": 16, "encoder_sequence_length": 4800}},
   {"file": "onnx-community--FastVLM-0.5B-ONNX/onnx/embed_tokens_quantized.onnx", "override_dims": {"batch_size": 1, "sequence_length": 64}},
   {"file": "onnx-community--FastVLM-0.5B-ONNX/onnx/vision_encoder_q4f16.onnx", "override_dims": {"s0": 1, "s1": 1024, "s2": 1024}},

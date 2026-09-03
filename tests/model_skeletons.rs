@@ -48,6 +48,11 @@ struct Entry {
     file: String,
     #[serde(default)]
     heavy: bool,
+    /// Reason this model cannot build on the CoreML backend (e.g. a hard
+    /// backend limit like max tensor rank 5). Skipped when built with
+    /// `--features coreml`; still exercised on the ORT backend.
+    #[serde(default)]
+    coreml_unsupported: Option<String>,
     #[serde(default)]
     override_dims: HashMap<String, u32>,
     #[serde(default)]
@@ -247,6 +252,18 @@ fn manifest_models_convert_and_build() {
         return;
     };
     let skip_heavy = std::env::var_os("O2W_MODEL_TEST_SKIP_HEAVY").is_some();
+    let entries: Vec<Entry> = entries
+        .into_iter()
+        .filter(|e| {
+            if cfg!(feature = "coreml") {
+                if let Some(reason) = &e.coreml_unsupported {
+                    eprintln!("skipping {} on CoreML: {reason}", e.file);
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
 
     let sweep = Sweep {
         source,

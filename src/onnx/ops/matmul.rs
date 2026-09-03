@@ -9,7 +9,7 @@
 
 use crate::onnx::builder::{map_op_error, operand_index, tensor_proto_to_bytes, OnnxBuilder};
 use crate::onnx::builder_helpers::{
-    i64_slice_to_mldim, output_label, record_node_output, reshape_with_shape,
+    i64_slice_to_mldim, output_label, record_node_output, reshape_with_shape, slice_with_params,
 };
 use crate::onnx::convert::{map_onnx_data_type, OnnxError};
 use crate::onnx::ops::conv::lookup_shape;
@@ -798,12 +798,35 @@ impl MatMulHandler {
             .builder
             .dequantize_linear_with_zeropoint(b_uint4, scales, zero_point)
             .map_err(map_op_error)?;
-        let weights = reshape_with_shape(
-            b,
-            dequantized,
-            &format!("{label}__weights_nk"),
-            i64_slice_to_mldim(&[n, k])?,
-        )?;
+        // The last block may be zero-padded (K not a multiple of block_size,
+        // e.g. K=8 with block_size=32): reshape to the padded width and slice
+        // the valid K columns before use.
+        let padded_k = (n_blocks * block_size_u) as i64;
+        let weights = if padded_k != k {
+            let padded = reshape_with_shape(
+                b,
+                dequantized,
+                &format!("{label}__weights_nk_padded"),
+                i64_slice_to_mldim(&[n, padded_k])?,
+            )?;
+            slice_with_params(
+                b,
+                padded,
+                &format!("{label}__weights_nk"),
+                &[0, 0],
+                &[
+                    rustnn::operator_options::MLDimension::Static(n_attr),
+                    rustnn::operator_options::MLDimension::Static(k_attr),
+                ],
+            )?
+        } else {
+            reshape_with_shape(
+                b,
+                dequantized,
+                &format!("{label}__weights_nk"),
+                i64_slice_to_mldim(&[n, k])?,
+            )?
+        };
         let weights = b
             .builder
             .transpose_with_options(
