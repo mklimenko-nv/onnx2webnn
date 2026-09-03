@@ -66,6 +66,7 @@ jobs:
 
       # Cargo.toml references rustnn as a sibling path dependency (../rustnn).
       - name: Checkout rustnn
+        id: rustnn
         uses: actions/checkout@v4
         with:
           repository: ${{ env.RUSTNN_REPO }}
@@ -83,14 +84,26 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cache cargo
+      # The registry cache only depends on Cargo.lock, but target/ must also
+      # key on the rustnn commit: sources are checked out BEFORE the cache is
+      # restored, so a stale target/ has newer fingerprints than the fresh
+      # rustnn sources and cargo silently skips rebuilding the path dependency.
+      # No restore-keys for target/ for the same reason — only an exact match
+      # is safe.
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            onnx2webnn/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('onnx2webnn/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('onnx2webnn/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: onnx2webnn/target
+          key: ${{ runner.os }}-target-${{ hashFiles('onnx2webnn/Cargo.lock') }}-${{ steps.rustnn.outputs.commit }}
 
       - name: Download ONNX Runtime ${{ env.ORT_VERSION }}
         run: |
