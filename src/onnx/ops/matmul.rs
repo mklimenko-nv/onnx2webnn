@@ -255,7 +255,7 @@ impl MatMulHandler {
                            tag: &str,
                            dt: DataType,
                            shape: &[u32],
-                           bytes: &[u8]|
+                           bytes: Vec<u8>|
          -> Result<MLOperand, OnnxError> {
             let name = format!("{label}__{tag}");
             b.register_constant_from_bytes(&name, dt, shape, bytes)?;
@@ -271,15 +271,21 @@ impl MatMulHandler {
             }
         };
 
-        let blob = const_bytes(b, "blob", DataType::Uint8, &[half], packed)?;
-        let c16 = const_bytes(b, "c16", DataType::Int32, &[1], &16i32.to_le_bytes())?;
-        let codebook = const_bytes(b, "codebook", dtype, &[16], &float_bytes(quant_map))?;
+        let blob = const_bytes(b, "blob", DataType::Uint8, &[half], packed.to_vec())?;
+        let c16 = const_bytes(
+            b,
+            "c16",
+            DataType::Int32,
+            &[1],
+            16i32.to_le_bytes().to_vec(),
+        )?;
+        let codebook = const_bytes(b, "codebook", dtype, &[16], float_bytes(quant_map))?;
         let scales = const_bytes(
             b,
             "absmax",
             dtype,
             &[n_blocks as u32, 1],
-            &float_bytes(absmax),
+            float_bytes(absmax),
         )?;
 
         let opts = |tag: &str| OnnxBuilder::labeled_options(&format!("{label}__{tag}"));
@@ -491,18 +497,13 @@ impl MatMulHandler {
                 .iter()
                 .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
                 .collect();
-            b.register_constant_from_bytes(
-                &weights_name,
-                DataType::Float16,
-                &weight_shape,
-                &bytes,
-            )?;
+            b.register_constant_from_bytes(&weights_name, DataType::Float16, &weight_shape, bytes)?;
         } else {
             b.register_constant_from_bytes(
                 &weights_name,
                 DataType::Float32,
                 &weight_shape,
-                bytemuck::cast_slice(&weights_kn),
+                bytemuck::cast_slice(&weights_kn).to_vec(),
             )?;
         }
         let weights = b.resolve_operand(&weights_name)?;
@@ -590,6 +591,102 @@ impl MatMulHandler {
         Ok(result)
     }
 
+    /// Lower a constant-initializer quantized operand as
+    /// `dequantizeLinear(x, scale = 1.0, zeroPoint)` instead of
+    /// `cast(x) - cast(zp)`. Same arithmetic, but the dequantize-of-constant
+    /// pattern is what backends recognize as weight decompression: CoreML
+    /// lowers it to `constexpr_affine_dequantize` and keeps the weight packed
+    /// through Espresso's compile instead of folding a dense float copy.
+    ///
+    /// Returns `None` (caller falls back to cast+sub) when the operand is not
+    /// a u8/i8 initializer, or when a vector zero point can't be re-registered
+    /// rank-aligned (non-2-D weight). `vector_zp_shape` carries the caller's
+    /// zero-point orientation: `Some(&[-1, 1])` marks a per-row zero point
+    /// (rows axis), `None` a per-column one (trailing axis).
+    fn dequantized_constant_operand(
+        &self,
+        b: &mut OnnxBuilder<'_, '_, '_>,
+        operand_name: &str,
+        zero_point_name: Option<&str>,
+        context: &ConversionContext,
+        vector_zp_shape: Option<&[i64]>,
+        label: &str,
+    ) -> Result<Option<MLOperand>, OnnxError> {
+        let Some(tensor) = context.initializers.get(operand_name) else {
+            return Ok(None);
+        };
+        if !matches!(
+            map_onnx_data_type(tensor.data_type),
+            Ok(DataType::Uint8 | DataType::Int8)
+        ) {
+            return Ok(None);
+        }
+        let zp_dtype = map_onnx_data_type(tensor.data_type)?;
+        let x = b.resolve_operand(operand_name)?;
+
+        // Zero point layout decides the scale/zeroPoint shape. Scalars (or
+        // absent zero points) pair with a scalar 1.0 scale; a per-column
+        // vector [N] on a 2-D weight [K, N] is re-registered rank-aligned as
+        // [1, N] so WebNN's blockwise rules (and the CoreML per-channel axis
+        // derivation) see an unambiguous axis.
+        let zp_tensor = match zero_point_name {
+            Some(name) => match context.initializers.get(name) {
+                Some(t) if map_onnx_data_type(t.data_type).ok() == Some(zp_dtype.clone()) => {
+                    Some(*t)
+                }
+                _ => return Ok(None),
+            },
+            None => None,
+        };
+        let zp_len = zp_tensor
+            .map(|t| t.dims.iter().product::<i64>().max(1))
+            .unwrap_or(1);
+        let zp_is_vector = zp_tensor.is_some_and(|t| t.dims.len() == 1 && t.dims[0] > 1);
+        if zp_len > 1 && !zp_is_vector {
+            // Multi-element zero point that is not a plain 1-D vector (e.g.
+            // already rank-aligned): keep the cast+sub fallback.
+            return Ok(None);
+        }
+
+        let (const_shape, ones_len): (Vec<u32>, usize) = if zp_is_vector {
+            // Per-row ([-1, 1] template) pins the zero point to axis 0,
+            // per-column (no template) to the trailing axis of a 2-D tensor.
+            let (shape, tensor_axis) = match vector_zp_shape {
+                Some([-1, 1]) => (vec![zp_len as u32, 1], 0),
+                None => (vec![1, zp_len as u32], 1),
+                _ => return Ok(None),
+            };
+            if tensor.dims.len() != 2 || tensor.dims[tensor_axis] != zp_len {
+                return Ok(None);
+            }
+            (shape, zp_len as usize)
+        } else {
+            (vec![], 1)
+        };
+
+        let scale_name = format!("{label}_dq_scale");
+        let ones: Vec<u8> = std::iter::repeat(1.0f32.to_le_bytes())
+            .take(ones_len)
+            .flatten()
+            .collect();
+        b.register_constant_from_bytes(&scale_name, DataType::Float32, &const_shape, ones)?;
+        let scale = b.resolve_operand(&scale_name)?;
+
+        let zp_name = format!("{label}_dq_zp");
+        let zp_bytes = match zp_tensor {
+            Some(t) => tensor_proto_to_bytes(t)?,
+            None => vec![0u8],
+        };
+        b.register_constant_from_bytes(&zp_name, zp_dtype, &const_shape, zp_bytes)?;
+        let zero_point = b.resolve_operand(&zp_name)?;
+
+        let out = b
+            .builder
+            .dequantize_linear_with_zeropoint(x, scale, zero_point)
+            .map_err(map_op_error)?;
+        Ok(Some(out))
+    }
+
     /// Cast a quantized operand to float32 and subtract its (optional) zero
     /// point. `vector_zp_shape` reshapes a 1-D zero point before subtraction;
     /// `-1` stands for the zero point's own length.
@@ -602,6 +699,16 @@ impl MatMulHandler {
         vector_zp_shape: Option<&[i64]>,
         label: &str,
     ) -> Result<MLOperand, OnnxError> {
+        if let Some(out) = self.dequantized_constant_operand(
+            b,
+            operand_name,
+            zero_point_name,
+            context,
+            vector_zp_shape,
+            label,
+        )? {
+            return Ok(out);
+        }
         let operand = b.resolve_operand(operand_name)?;
         let as_float = b
             .builder
@@ -763,7 +870,7 @@ impl MatMulHandler {
             (DataType::Uint8, [n_attr, n_blocks, blob_size])
         };
         let b_uint4_name = format!("{label}__B_quant");
-        b.register_constant_from_bytes(&b_uint4_name, weight_dtype, &weight_shape, &packed)?;
+        b.register_constant_from_bytes(&b_uint4_name, weight_dtype, &weight_shape, packed)?;
         let b_uint4 = b.resolve_operand(&b_uint4_name)?;
 
         let scales_tensor = context
@@ -780,7 +887,7 @@ impl MatMulHandler {
             &scales_shape_name,
             scales_dtype,
             &[n_attr, n_blocks, 1],
-            &scales_bytes,
+            scales_bytes,
         )?;
         let scales = b.resolve_operand(&scales_shape_name)?;
 
@@ -904,7 +1011,7 @@ fn register_matmul_nbits_zero_point(
         vec![default_byte; packed_len]
     };
 
-    b.register_constant_from_bytes(label, zp_dtype, &zp_shape, &packed)?;
+    b.register_constant_from_bytes(label, zp_dtype, &zp_shape, packed)?;
     b.resolve_operand(label)
 }
 

@@ -455,3 +455,87 @@ fn average_pool_count_include_pad_1d_matches_ort() {
         17,
     );
 }
+
+/// QDQ conv weights: `DequantizeLinear(const u8 W)` feeding a `Conv` filter.
+/// On CoreML this takes the `constexpr_affine_dequantize` path AND requires
+/// the deferred filter-layout transpose keyed on the dequantize output to be
+/// flushed; a dropped transpose changes the numerics.
+fn build_qdq_conv() -> ModelProto {
+    use onnx2webnn::test_models::prelude::*;
+
+    let w: Vec<u8> = (0..2 * 3 * 3 * 3).map(|i| (i * 7 % 251) as u8).collect();
+    model(
+        17,
+        graph(
+            "test_QdqConv_graph",
+            vec![f32_input("x", &[1, 3, 5, 5])],
+            vec![f32_output("y", &[1, 2, 3, 3])],
+            vec![
+                node(
+                    "DequantizeLinear",
+                    "deq_w",
+                    &["w_q", "w_scale", "w_zp"],
+                    &["w"],
+                    &[],
+                ),
+                node(
+                    "Conv",
+                    "conv",
+                    &["x", "w"],
+                    &["y"],
+                    &[attr_int("group", 1), attr_string("auto_pad", "NOTSET")],
+                ),
+            ],
+            vec![
+                u8_init("w_q", &[2, 3, 3, 3], &w),
+                f32_init("w_scale", &[], &[0.043]),
+                u8_init("w_zp", &[], &[121]),
+            ],
+        ),
+    )
+}
+
+#[test]
+fn qdq_conv_weights_match_ort() {
+    assert_op_matches_ort(build_qdq_conv(), ExpectConvertOp::Success, 17);
+}
+
+/// MatMulInteger with a per-column vector `b_zero_point` on a SQUARE constant
+/// weight: the weight-side lowering re-registers the zero point rank-aligned
+/// as `[1, N]`, and the CoreML per-channel axis derivation must pick the
+/// trailing axis even though both dims match the channel count.
+fn build_matmul_integer_vector_zp() -> ModelProto {
+    use onnx2webnn::test_models::prelude::*;
+
+    let b: Vec<u8> = (0..16).map(|i| (i * 13 % 251) as u8).collect();
+    model(
+        10,
+        graph(
+            "test_MatMulIntegerVecZp_graph",
+            vec![],
+            vec![i32_output("y", &[2, 4])],
+            vec![node(
+                "MatMulInteger",
+                "mmi",
+                &["a", "b", "a_zp", "b_zp"],
+                &["y"],
+                &[],
+            )],
+            vec![
+                u8_init("a", &[2, 4], &[3, 250, 7, 41, 128, 0, 99, 200]),
+                u8_init("b", &[4, 4], &b),
+                u8_init("a_zp", &[], &[128]),
+                u8_init("b_zp", &[4], &[1, 77, 128, 254]),
+            ],
+        ),
+    )
+}
+
+#[test]
+fn matmul_integer_vector_zero_point_matches_ort() {
+    assert_op_matches_ort(
+        build_matmul_integer_vector_zp(),
+        ExpectConvertOp::Success,
+        10,
+    );
+}

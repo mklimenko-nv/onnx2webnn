@@ -378,7 +378,7 @@ fn register_test_operand(
         } else {
             dummy_constant_bytes(dtype, numel)
         };
-        builder.register_constant_from_bytes(name, dtype, &shape, &bytes)?;
+        builder.register_constant_from_bytes(name, dtype, &shape, bytes)?;
         return Ok(());
     }
 

@@ -931,7 +931,7 @@ fn register_f32_scalar(
     name: &str,
     value: f32,
 ) -> Result<MLOperand, OnnxError> {
-    b.register_constant_from_bytes(name, DataType::Float32, &[1], &value.to_le_bytes())?;
+    b.register_constant_from_bytes(name, DataType::Float32, &[1], value.to_le_bytes().to_vec())?;
     b.resolve_operand(name)
 }
 
@@ -944,7 +944,12 @@ fn register_scalar_like(
     match data_type {
         DataType::Float16 => {
             let bits = f16::from_f32(value).to_bits();
-            b.register_constant_from_bytes(name, DataType::Float16, &[1], &bits.to_le_bytes())?;
+            b.register_constant_from_bytes(
+                name,
+                DataType::Float16,
+                &[1],
+                bits.to_le_bytes().to_vec(),
+            )?;
             b.resolve_operand(name)
         }
         _ => register_f32_scalar(b, name, value),

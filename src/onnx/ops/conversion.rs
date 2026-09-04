@@ -211,7 +211,7 @@ impl ConversionHandler {
         let data_type = crate::onnx::convert::map_onnx_data_type(tensor.data_type)?;
         let shape: Vec<u32> = tensor.dims.iter().map(|&d| d.max(0) as u32).collect();
         let bytes = tensor_proto_to_bytes(tensor)?;
-        b.register_constant_from_bytes(onnx_out, data_type, &shape, &bytes)?;
+        b.register_constant_from_bytes(onnx_out, data_type, &shape, bytes)?;
         Ok(ConversionResult::default())
     }
 
@@ -450,7 +450,7 @@ fn register_f32_scalar(
     name: &str,
     value: f32,
 ) -> Result<MLOperand, OnnxError> {
-    b.register_constant_from_bytes(name, DataType::Float32, &[], &value.to_le_bytes())?;
+    b.register_constant_from_bytes(name, DataType::Float32, &[], value.to_le_bytes().to_vec())?;
     b.resolve_operand(name)
 }
 

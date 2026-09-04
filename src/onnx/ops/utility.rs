@@ -270,9 +270,9 @@ impl UtilityHandler {
 
         // Negative indices count from the end: idx < 0 ? idx + depth : idx.
         let zero_name = format!("{label}__zero");
-        b.register_constant_from_bytes(&zero_name, index_dtype, &[1], &index_bytes(0)?)?;
+        b.register_constant_from_bytes(&zero_name, index_dtype, &[1], index_bytes(0)?)?;
         let depth_name = format!("{label}__depth");
-        b.register_constant_from_bytes(&depth_name, index_dtype, &[1], &index_bytes(depth)?)?;
+        b.register_constant_from_bytes(&depth_name, index_dtype, &[1], index_bytes(depth)?)?;
         let zero = b.resolve_operand(&zero_name)?;
         let depth_op = b.resolve_operand(&depth_name)?;
         let negative = b
@@ -307,7 +307,7 @@ impl UtilityHandler {
             .collect::<Result<Vec<_>, _>>()?
             .concat();
         let range_dims: Vec<u32> = range_shape.iter().map(|&d| d as u32).collect();
-        b.register_constant_from_bytes(&range_name, index_dtype, &range_dims, &range_bytes)?;
+        b.register_constant_from_bytes(&range_name, index_dtype, &range_dims, range_bytes)?;
         let range = b.resolve_operand(&range_name)?;
         let hit = b
             .builder
@@ -320,8 +320,13 @@ impl UtilityHandler {
 
         let off_name = format!("{label}__off");
         let on_name = format!("{label}__on");
-        b.register_constant_from_bytes(&off_name, value_dtype, &[1], &value_bytes[..elem])?;
-        b.register_constant_from_bytes(&on_name, value_dtype, &[1], &value_bytes[elem..2 * elem])?;
+        b.register_constant_from_bytes(&off_name, value_dtype, &[1], value_bytes[..elem].to_vec())?;
+        b.register_constant_from_bytes(
+            &on_name,
+            value_dtype,
+            &[1],
+            value_bytes[elem..2 * elem].to_vec(),
+        )?;
         let off = b.resolve_operand(&off_name)?;
         let on = b.resolve_operand(&on_name)?;
         let out = b
@@ -532,7 +537,7 @@ impl UtilityHandler {
                 &range_const_name,
                 DataType::Int64,
                 &[values.len() as u32],
-                &bytes,
+                bytes,
             )?;
 
             let range_const = b.resolve_operand(&range_const_name)?;
@@ -612,7 +617,7 @@ impl UtilityHandler {
             &output_name,
             DataType::Int64,
             &[values.len() as u32],
-            &bytes,
+            bytes,
         )?;
         if let Some(out) = node.output.as_slice().first() {
             record_node_output(b, out, &output_name, b.resolve_operand(&output_name)?);
@@ -684,7 +689,7 @@ impl UtilityHandler {
                 .collect(),
             _ => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
         };
-        b.register_constant_from_bytes(output_name, dtype, &[values.len() as u32], &bytes)?;
+        b.register_constant_from_bytes(output_name, dtype, &[values.len() as u32], bytes)?;
         if let Some(out) = node.output.as_slice().first() {
             record_node_output(b, out, output_name, b.resolve_operand(output_name)?);
         }
@@ -792,7 +797,7 @@ impl UtilityHandler {
         };
 
         // Packed table: [rows, packed_cols] uint8 for 4-bit, [rows, cols] for 8-bit.
-        let table_bytes = tensor_proto_to_bytes(t.data)?;
+        let mut table_bytes = tensor_proto_to_bytes(t.data)?;
         let table_len = rows_u * t.packed_cols as usize;
         if table_bytes.len() < table_len {
             return Err(OnnxError::InvalidShape(format!(
@@ -801,15 +806,16 @@ impl UtilityHandler {
             )));
         }
         let table_name = format!("{output_name}__table");
+        table_bytes.truncate(table_len);
         b.register_constant_from_bytes(
             &table_name,
             DataType::Uint8,
             &[rows as u32, t.packed_cols as u32],
-            &table_bytes[..table_len],
+            table_bytes,
         )?;
 
         let scales_dtype = crate::onnx::convert::map_onnx_data_type(t.scales.data_type)?;
-        let scales_bytes = tensor_proto_to_bytes(t.scales)?;
+        let mut scales_bytes = tensor_proto_to_bytes(t.scales)?;
         let scales_len = rows_u * blocks_u * (scales_dtype.bits_per_element() / 8);
         if scales_bytes.len() < scales_len {
             return Err(OnnxError::InvalidShape(format!(
@@ -818,11 +824,12 @@ impl UtilityHandler {
             )));
         }
         let scales_name = format!("{output_name}__scales");
+        scales_bytes.truncate(scales_len);
         b.register_constant_from_bytes(
             &scales_name,
             scales_dtype,
             &[rows as u32, t.blocks as u32],
-            &scales_bytes[..scales_len],
+            scales_bytes,
         )?;
 
         // One byte per zero point; defaults: 8 (uint4), 128 (uint8), 0 (signed).
@@ -865,7 +872,7 @@ impl UtilityHandler {
             &zp_name,
             value_dtype,
             &[rows as u32, t.blocks as u32],
-            &zp_values,
+            zp_values,
         )?;
 
         let indices = b.resolve_operand(&inputs[1])?;
@@ -905,7 +912,8 @@ impl UtilityHandler {
                              v: i32|
              -> Result<MLOperand, OnnxError> {
                 let name = format!("{output_name}__{tag}");
-                b.register_constant_from_bytes(&name, DataType::Int32, &[1], &v.to_le_bytes())?;
+                let bytes = v.to_le_bytes().to_vec();
+                b.register_constant_from_bytes(&name, DataType::Int32, &[1], bytes)?;
                 b.resolve_operand(&name)
             };
             let c16 = const_i32(b, "c16", 16)?;
@@ -1117,7 +1125,7 @@ impl UtilityHandler {
                 _ => fill_value_i64.to_le_bytes().to_vec(),
             };
             let scalar_name = format!("{}_fill", output_name);
-            b.register_constant_from_bytes(&scalar_name, dtype, &[1], &scalar_bytes)?;
+            b.register_constant_from_bytes(&scalar_name, dtype, &[1], scalar_bytes)?;
 
             let scalar = b.resolve_operand(&scalar_name)?;
             let out = expand_with_shape(b, scalar, &output_name, ast_dims_to_mldim(dims))?;
@@ -1174,7 +1182,7 @@ impl UtilityHandler {
             &output_name,
             dtype,
             &shape.iter().map(|d| *d as u32).collect::<Vec<_>>(),
-            &bytes,
+            bytes,
         )?;
         if let Some(out) = node.output.as_slice().first() {
             record_node_output(b, out, &output_name, b.resolve_operand(&output_name)?);
@@ -1471,7 +1479,7 @@ impl UtilityHandler {
                     &table_name,
                     DataType::Float16,
                     &table_shape,
-                    &bytes,
+                    bytes,
                 )?;
             }
             _ => {
@@ -1479,7 +1487,7 @@ impl UtilityHandler {
                     &table_name,
                     DataType::Float32,
                     &table_shape,
-                    bytemuck::cast_slice(&values),
+                    bytemuck::cast_slice::<f32, u8>(&values).to_vec(),
                 )?;
             }
         }

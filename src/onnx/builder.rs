@@ -189,40 +189,38 @@ impl<'a, 'ctx, 'bld> OnnxBuilder<'a, 'ctx, 'bld> {
         }
     }
 
+    /// Register a constant, handing the byte buffer to rustnn without a copy.
+    /// Weight tensors reach hundreds of MB and the buffer stays alive for the
+    /// whole backend compile, so every avoided copy matters. rustnn stores
+    /// plain little-endian bytes, so no typed round-trip is needed.
     pub fn register_constant_from_bytes(
         &mut self,
         name: &str,
         data_type: DataType,
         shape: &[u32],
-        bytes: &[u8],
+        bytes: Vec<u8>,
     ) -> Result<(), OnnxError> {
         let id = Self::webnn_id(name);
         let desc = descriptor_static(data_type, shape)?;
-        // pod_collect_to_vec copies, tolerating unaligned byte buffers (raw
-        // protobuf payloads carry no alignment guarantee).
-        let op = match data_type {
-            DataType::Float32 => self
-                .builder
-                .constant_from_slice(&desc, &bytemuck::pod_collect_to_vec::<u8, f32>(bytes)),
-            DataType::Float16 => self
-                .builder
-                .constant_from_slice(&desc, &bytemuck::pod_collect_to_vec::<u8, u16>(bytes)),
-            DataType::Int32 => self
-                .builder
-                .constant_from_slice(&desc, &bytemuck::pod_collect_to_vec::<u8, i32>(bytes)),
-            DataType::Int64 => self
-                .builder
-                .constant_from_slice(&desc, &bytemuck::pod_collect_to_vec::<u8, i64>(bytes)),
-            DataType::Uint8 | DataType::Int8 | DataType::Uint4 | DataType::Int4 => {
-                self.builder.constant_from_slice(&desc, bytes)
-            }
+        match data_type {
+            DataType::Float32
+            | DataType::Float16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Uint8
+            | DataType::Int8
+            | DataType::Uint4
+            | DataType::Int4 => {}
             other => {
                 return Err(OnnxError::InvalidShape(format!(
                     "unsupported constant data type for builder: {other:?}"
                 )));
             }
         }
-        .map_err(map_rustnn_error)?;
+        let op = self
+            .builder
+            .constant_from_bytes(&desc, bytes)
+            .map_err(map_rustnn_error)?;
         self.constant_operands.insert(operand_index(op));
         self.record_operand(&[name, &id], op);
         Ok(())

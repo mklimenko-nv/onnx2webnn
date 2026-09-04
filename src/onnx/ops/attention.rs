@@ -617,9 +617,14 @@ fn register_scalar(
             name,
             DataType::Float16,
             &[1],
-            &half::f16::from_f32(value).to_le_bytes(),
+            half::f16::from_f32(value).to_le_bytes().to_vec(),
         ),
-        _ => b.register_constant_from_bytes(name, DataType::Float32, &[1], &value.to_le_bytes()),
+        _ => b.register_constant_from_bytes(
+            name,
+            DataType::Float32,
+            &[1],
+            value.to_le_bytes().to_vec(),
+        ),
     }
 }
 
@@ -653,13 +658,13 @@ fn register_causal_mask(
                 .iter()
                 .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
                 .collect();
-            b.register_constant_from_bytes(name, DataType::Float16, &shape, &bytes)
+            b.register_constant_from_bytes(name, DataType::Float16, &shape, bytes)
         }
         _ => b.register_constant_from_bytes(
             name,
             DataType::Float32,
             &shape,
-            bytemuck::cast_slice(&mask),
+            bytemuck::cast_slice(&mask).to_vec(),
         ),
     }
 }

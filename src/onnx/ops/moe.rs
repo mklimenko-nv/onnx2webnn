@@ -73,9 +73,14 @@ fn scalar_const(
             name,
             DataType::Float16,
             &[1],
-            &half::f16::from_f32(value).to_le_bytes(),
+            half::f16::from_f32(value).to_le_bytes().to_vec(),
         )?,
-        _ => b.register_constant_from_bytes(name, DataType::Float32, &[1], &value.to_le_bytes())?,
+        _ => b.register_constant_from_bytes(
+            name,
+            DataType::Float32,
+            &[1],
+            value.to_le_bytes().to_vec(),
+        )?,
     }
     b.resolve_operand(name)
 }
@@ -139,7 +144,7 @@ fn dequantize_expert_weights(
         )));
     }
 
-    let bytes = crate::onnx::builder::tensor_proto_to_bytes(w_tensor)?;
+    let mut bytes = crate::onnx::builder::tensor_proto_to_bytes(w_tensor)?;
     let (rows_total, packed_u, in_u, blocks_u) = (
         (experts * out_rows) as usize,
         packed as usize,
@@ -162,18 +167,15 @@ fn dequantize_expert_weights(
             (DataType::Uint8, 0x80u8, rows_total * blocks_u)
         };
         let q_name = format!("{const_name}__q");
-        b.register_constant_from_bytes(
-            &q_name,
-            q_dtype,
-            &shape_u32,
-            &bytes[..rows_total * packed_u],
-        )?;
+        // Drop any trailing padding and move the payload without copying.
+        bytes.truncate(rows_total * packed_u);
+        b.register_constant_from_bytes(&q_name, q_dtype, &shape_u32, bytes)?;
         let s_dtype = crate::onnx::convert::map_onnx_data_type(s_tensor.data_type)?;
         let s_bytes = crate::onnx::builder::tensor_proto_to_bytes(s_tensor)?;
         let s_name = format!("{const_name}__scales");
-        b.register_constant_from_bytes(&s_name, s_dtype, &block_shape, &s_bytes)?;
+        b.register_constant_from_bytes(&s_name, s_dtype, &block_shape, s_bytes)?;
         let zp_name = format!("{const_name}__zp");
-        b.register_constant_from_bytes(&zp_name, q_dtype, &block_shape, &vec![zp_byte; zp_len])?;
+        b.register_constant_from_bytes(&zp_name, q_dtype, &block_shape, vec![zp_byte; zp_len])?;
         let q = b.resolve_operand(&q_name)?;
         let s = b.resolve_operand(&s_name)?;
         let zp = b.resolve_operand(&zp_name)?;
@@ -229,14 +231,14 @@ fn dequantize_expert_weights(
                 .iter()
                 .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
                 .collect();
-            b.register_constant_from_bytes(const_name, DataType::Float16, &shape_u32, &bytes)?;
+            b.register_constant_from_bytes(const_name, DataType::Float16, &shape_u32, bytes)?;
         }
         _ => {
             b.register_constant_from_bytes(
                 const_name,
                 DataType::Float32,
                 &shape_u32,
-                bytemuck::cast_slice(&values),
+                bytemuck::cast_slice(&values).to_vec(),
             )?;
         }
     }

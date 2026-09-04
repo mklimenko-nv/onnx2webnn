@@ -755,7 +755,7 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 .collect();
 
             let bytes = tensor_proto_to_bytes(initializer)?;
-            b.register_constant_from_bytes(initializer.name.as_str(), data_type, &shape, &bytes)?;
+            b.register_constant_from_bytes(initializer.name.as_str(), data_type, &shape, bytes)?;
 
             value_name_map.insert(initializer.name.as_str().to_string(), name.clone());
             value_name_map.insert(name.clone(), name.clone());
@@ -1256,7 +1256,7 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                 &const_name,
                                 DataType::Int64,
                                 &shape,
-                                &bytes,
+                                bytes,
                             )?;
 
                             value_name_map.insert(out.to_string(), const_name.clone());
@@ -1335,7 +1335,7 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                         };
 
                         let shape_u32: Vec<u32> = shape.iter().map(|d| *d as u32).collect();
-                        b.register_constant_from_bytes(&const_name, dtype, &shape_u32, &bytes)?;
+                        b.register_constant_from_bytes(&const_name, dtype, &shape_u32, bytes)?;
 
                         value_name_map.insert(out.to_string(), const_name.clone());
                         value_name_map.insert(const_name.clone(), const_name.clone());
@@ -1425,6 +1425,31 @@ fn zero_fill_external_tensors(
         }
     }
     Ok(())
+}
+
+/// Drop every initializer payload (graph and subgraphs), keeping names, dims
+/// and types. Called once lowering has copied all constants into the WebNN
+/// graph, so the proto's weight volume is released before the backend compile.
+fn strip_initializer_payloads(graph: &mut crate::protos::onnx::GraphProto) {
+    for tensor in graph.initializer.iter_mut() {
+        tensor.raw_data = Vec::new();
+        tensor.float_data = Vec::new();
+        tensor.int32_data = Vec::new();
+        tensor.int64_data = Vec::new();
+        tensor.double_data = Vec::new();
+        tensor.uint64_data = Vec::new();
+        tensor.string_data = Vec::new();
+    }
+    for node in graph.node.iter_mut() {
+        for attr in node.attribute.iter_mut() {
+            if let Some(sub) = attr.g.as_mut() {
+                strip_initializer_payloads(sub);
+            }
+            for sub in attr.graphs.iter_mut() {
+                strip_initializer_payloads(sub);
+            }
+        }
+    }
 }
 
 /// Byte size of a tensor from its dims and element type.
@@ -1880,7 +1905,7 @@ pub(crate) fn convert_model(
         prune_unused_graph_inputs(&mut model);
     }
     // Move, don't clone: `model` carries every weight tensor.
-    let converter = OnnxConverter::new(model)?;
+    let mut converter = OnnxConverter::new(model)?;
     converter.extract_metadata()?;
 
     let mut context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, false))
@@ -1890,6 +1915,14 @@ pub(crate) fn convert_model(
     let mut onnx_builder = OnnxBuilder::new(&mut ml_builder);
 
     converter.convert_with_builder(&mut onnx_builder, options)?;
+
+    // Every constant now lives in the WebNN graph; the proto's copy of the
+    // weights would otherwise stay resident through the whole backend compile
+    // in `finish_build` (for real models that is the full weight volume). Only
+    // the graph's output names are read from the proto below.
+    if let Some(graph) = converter.model.graph.as_mut() {
+        strip_initializer_payloads(graph);
+    }
 
     let onnx_graph = converter
         .model
