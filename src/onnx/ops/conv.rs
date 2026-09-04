@@ -138,7 +138,7 @@ fn parse_conv_attrs(node: &NodeProto) -> ConvAttrs {
     attrs
 }
 
-fn lookup_shape(name: &str, context: &ConversionContext) -> Option<Vec<i64>> {
+pub(crate) fn lookup_shape(name: &str, context: &ConversionContext) -> Option<Vec<i64>> {
     if let Some(s) = context.value_shapes.get(name) {
         return Some(s.clone());
     }
@@ -326,7 +326,8 @@ impl ConvHandler {
                 "ConvInteger requires known filter shape for '{filter_raw}'"
             ))
         })?;
-        if input_shape.len() != 4 || filter_shape.len() != 4 {
+        let rank = input_shape.len();
+        if !(rank == 3 || rank == 4) || filter_shape.len() != rank {
             return Err(OnnxError::unsupported_op(
                 format!("ConvInteger{}D", input_shape.len().saturating_sub(2)),
                 node_name,
@@ -359,7 +360,37 @@ impl ConvHandler {
             &format!("{output_name}_filter"),
         )?;
 
-        let attrs = parse_conv_attrs(node);
+        let mut attrs = parse_conv_attrs(node);
+        // 1-D ConvInteger: run the centered float operands through the same
+        // trailing-unit-dim conv2d emulation regular 1-D Conv uses.
+        let (input, filter) = if rank == 3 {
+            attrs.strides = Some(extend_with_one(attrs.strides.as_deref(), 1, 2));
+            attrs.dilations = Some(extend_with_one(attrs.dilations.as_deref(), 1, 2));
+            attrs.pads = Some(extend_pads_to_2d(attrs.pads.as_deref()));
+            attrs.kernel_shape = attrs
+                .kernel_shape
+                .as_ref()
+                .map(|ks| extend_with_one(Some(ks.as_slice()), 1, 2));
+            let x4d = b
+                .builder
+                .reshape_with_options(
+                    input,
+                    i64_slice_to_mldim(&[input_shape[0], input_shape[1], input_shape[2], 1])?,
+                    OnnxBuilder::labeled_options(&format!("{output_name}_x4d")),
+                )
+                .map_err(map_op_error)?;
+            let w4d = b
+                .builder
+                .reshape_with_options(
+                    filter,
+                    i64_slice_to_mldim(&[filter_shape[0], filter_shape[1], filter_shape[2], 1])?,
+                    OnnxBuilder::labeled_options(&format!("{output_name}_w4d")),
+                )
+                .map_err(map_op_error)?;
+            (x4d, w4d)
+        } else {
+            (input, filter)
+        };
         let conv = b
             .builder
             .conv2_with_options(
@@ -368,14 +399,42 @@ impl ConvHandler {
                 build_conv2d_options(&attrs, &format!("{output_name}_conv2d"))?,
             )
             .map_err(map_op_error)?;
-        let out = b
+        let mut out = b
             .builder
             .cast_with_options(
                 conv,
                 MLOperandDataType::Int32,
-                OnnxBuilder::labeled_options(&output_name),
+                OnnxBuilder::labeled_options(&format!("{output_name}_i32")),
             )
             .map_err(map_op_error)?;
+        if rank == 3 {
+            let strides = attrs.strides.clone().unwrap_or_else(|| vec![1, 1]);
+            let dilations = attrs.dilations.clone().unwrap_or_else(|| vec![1, 1]);
+            let pads = attrs.pads.clone().unwrap_or_else(|| vec![0, 0, 0, 0]);
+            let effective_pads = if attrs.auto_pad == "VALID" {
+                vec![0, 0, 0, 0]
+            } else if map_auto_pad(&attrs.auto_pad) == "explicit" {
+                onnx_pads_to_webnn(&pads, 2)
+            } else {
+                vec![0, 0, 0, 0]
+            };
+            let spatial_out = conv2d_spatial_out(
+                input_shape[2],
+                filter_shape[2],
+                strides[0],
+                dilations[0],
+                effective_pads[0],
+                effective_pads[1],
+            );
+            out = b
+                .builder
+                .reshape_with_options(
+                    out,
+                    i64_slice_to_mldim(&[input_shape[0], filter_shape[0], spatial_out])?,
+                    OnnxBuilder::labeled_options(&output_name),
+                )
+                .map_err(map_op_error)?;
+        }
 
         if let Some(onnx_out) = node.output.first() {
             record_node_output(b, onnx_out, &output_name, out);
@@ -510,7 +569,7 @@ impl ConvHandler {
             }
         } else {
             return Err(OnnxError::InvalidShape(format!(
-                "{}: cannot determine spatial rank — provide kernel_shape attribute or filter/input shape info",
+                "{}: cannot determine spatial rank - provide kernel_shape attribute or filter/input shape info",
                 op_label,
             )));
         };

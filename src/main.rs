@@ -54,6 +54,16 @@ enum Command {
         #[arg(long = "override-dims-file")]
         override_dims_file: Option<String>,
 
+        /// Freeze a graph input to a constant, e.g. use_cache_branch=false
+        /// (repeatable). Constant `If` gates are then inlined.
+        #[arg(long = "pin-input")]
+        pin_inputs: Vec<String>,
+
+        /// Zero-fill external tensors whose data file is missing (weight-stripped
+        /// skeleton models; graph structure only)
+        #[arg(long = "allow-missing-external-data")]
+        allow_missing_external_data: bool,
+
         /// Enable constant folding (Shape/Gather/Concat/Reshape pipelines)
         #[arg(long)]
         optimize: bool,
@@ -75,6 +85,8 @@ fn main() -> anyhow::Result<()> {
             input,
             override_dims,
             override_dims_file,
+            pin_inputs,
+            allow_missing_external_data,
             optimize,
             experimental_dynamic_inputs,
         } => {
@@ -125,10 +137,19 @@ fn main() -> anyhow::Result<()> {
 
             let input_path = Path::new(&input);
 
+            let mut pinned_inputs = HashMap::new();
+            for spec in pin_inputs {
+                let (name, value) = onnx2webnn::onnx::convert::parse_pinned_input(&spec)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                pinned_inputs.insert(name, value);
+            }
+
             let options = ConvertOptions {
                 free_dim_overrides,
                 optimize,
                 experimental_dynamic_inputs,
+                pinned_inputs,
+                zero_fill_missing_external_data: allow_missing_external_data,
             };
 
             let _validated = convert_onnx(input_path.to_str().unwrap(), options)

@@ -4,26 +4,94 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// MatMul, Gemm, and MatMulNBits (com.microsoft) operator handlers
+// MatMul, Gemm, MatMulInteger, and the com.microsoft quantized matmuls
+// (MatMulNBits, MatMulBnb4)
 
-use crate::onnx::builder::{
-    map_op_error, operand_index, tensor_proto_to_bytes, OnnxBuilder,
-};
+use crate::onnx::builder::{map_op_error, operand_index, tensor_proto_to_bytes, OnnxBuilder};
 use crate::onnx::builder_helpers::{
-    i64_slice_to_mldim, output_label, record_node_output, reshape_with_shape,
+    i64_slice_to_mldim, output_label, record_node_output, reshape_with_shape, slice_with_params,
 };
-use crate::onnx::convert::OnnxError;
+use crate::onnx::convert::{map_onnx_data_type, OnnxError};
+use crate::onnx::ops::conv::lookup_shape;
 use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
-use crate::protos::onnx::{TensorProto_DataType, NodeProto};
+use crate::protos::onnx::{NodeProto, TensorProto_DataType};
 use rustnn::mlcontext::MLOperand;
+use rustnn::operator_enums::MLOperandDataType;
 use rustnn::operator_options::{MLGemmOptions, MLTransposeOptions};
 use rustnn::DataType;
+
+/// bitsandbytes 4-bit codebooks, copied verbatim from ONNX Runtime's
+/// `blockwise_quant_block_bnb4.h` so dequantization matches ORT bit-for-bit.
+const FP4_QUANT_MAP: [f32; 16] = [
+    0.0,
+    5.208_333_5e-3,
+    0.666_666_7,
+    1.0,
+    0.333_333_34,
+    0.5,
+    0.166_666_67,
+    0.25,
+    -0.0,
+    -5.208_333_5e-3,
+    -0.666_666_7,
+    -1.0,
+    -0.333_333_34,
+    -0.5,
+    -0.166_666_67,
+    -0.25,
+];
+
+const NF4_QUANT_MAP: [f32; 16] = [
+    -1.0,
+    -0.696_192_8,
+    -0.525_073_05,
+    -0.394_917_5,
+    -0.284_441_38,
+    -0.184_773_43,
+    -0.091_050_036,
+    0.0,
+    0.079_580_3,
+    0.160_930_2,
+    0.246_112_3,
+    0.337_915_24,
+    0.440_709_83,
+    0.562_617,
+    0.722_956_84,
+    1.0,
+];
+
+/// Decode a float32/float16 initializer into f32 values (MatMulBnb4 absmax,
+/// QMoE scales).
+pub(crate) fn decode_float_tensor_as_f32(
+    tensor: &crate::protos::onnx::TensorProto,
+) -> Result<Vec<f32>, OnnxError> {
+    let bytes = tensor_proto_to_bytes(tensor)?;
+    if tensor.data_type == TensorProto_DataType::Float as i32 {
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    } else if tensor.data_type == TensorProto_DataType::Float16 as i32 {
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect())
+    } else {
+        Err(OnnxError::InvalidShape(format!(
+            "expected float/float16 tensor, got data_type={}",
+            tensor.data_type
+        )))
+    }
+}
 
 pub struct MatMulHandler;
 
 impl OpHandler for MatMulHandler {
     fn supports(&self, op_type: &str) -> bool {
-        matches!(op_type, "MatMul" | "Gemm" | "MatMulNBits")
+        matches!(
+            op_type,
+            "MatMul" | "Gemm" | "MatMulNBits" | "MatMulInteger" | "MatMulBnb4"
+        )
     }
 
     fn convert(
@@ -43,6 +111,8 @@ impl OpHandler for MatMulHandler {
             "MatMul" => self.convert_matmul(node, &node_name, b),
             "Gemm" => self.convert_gemm(node, &node_name, context, b),
             "MatMulNBits" => self.convert_matmul_nbits(node, &node_name, context, b),
+            "MatMulInteger" => self.convert_matmul_integer(node, &node_name, context, b),
+            "MatMulBnb4" => self.convert_matmul_bnb4(node, &node_name, context, b),
             _ => Err(OnnxError::unsupported_op(op_type.to_string(), node_name)),
         }
     }
@@ -138,11 +208,561 @@ impl MatMulHandler {
         Ok(ConversionResult::default())
     }
 
-    /// Lower `com.microsoft.MatMulNBits` the same way ORT's WebNN EP does:
-    /// `dequantizeLinear` → reshape `[N,K]` → transpose `[K,N]` → `matmul` (+ optional bias).
+    /// Lower `com.microsoft.MatMulBnb4` by dequantizing the constant packed
+    /// weights at conversion time and emitting a plain `matmul`.
     ///
-    /// Supported: bits=4, constant packed `B`, optional constant zero_points, optional bias.
-    /// Rejected: bits≠4, `g_idx`, non-constant `B`/`zero_points`.
+    /// bitsandbytes FP4/NF4 uses a 16-entry codebook (not affine quantization),
+    /// so WebNN `dequantizeLinear` cannot express it; since `B`/`absmax` are
+    /// always initializers, decoding them into a dense `[K, N]` float constant
+    /// is exact. Note this trades the 4-bit weight footprint for full-precision
+    /// constants in the WebNN graph.
+    /// MatMulBnb4 with the weight kept packed: unpack nibbles, look them up
+    /// in the codebook, scale per block, then matmul.
+    #[allow(clippy::too_many_arguments)]
+    fn convert_matmul_bnb4_packed(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+        b: &mut OnnxBuilder<'_, '_, '_>,
+        packed: &[u8],
+        quant_map: &[f32; 16],
+        absmax: &[f32],
+        n: i64,
+        k: i64,
+        block_size: i64,
+    ) -> Result<ConversionResult, OnnxError> {
+        use crate::onnx::builder::map_ast_data_type;
+        use rustnn::operator_options::MLGatherOptions;
+
+        let label = output_label(node, node_name);
+        let a_name = node
+            .input
+            .as_slice()
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let dtype = context
+            .value_types
+            .get(a_name)
+            .copied()
+            .unwrap_or(DataType::Float32);
+        let total = (n * k) as usize;
+        let n_blocks = absmax.len() as i64;
+        let half = packed.len() as u32;
+
+        let const_bytes = |b: &mut OnnxBuilder<'_, '_, '_>,
+                           tag: &str,
+                           dt: DataType,
+                           shape: &[u32],
+                           bytes: Vec<u8>|
+         -> Result<MLOperand, OnnxError> {
+            let name = format!("{label}__{tag}");
+            b.register_constant_from_bytes(&name, dt, shape, bytes)?;
+            b.resolve_operand(&name)
+        };
+        let float_bytes = |values: &[f32]| -> Vec<u8> {
+            match dtype {
+                DataType::Float16 => values
+                    .iter()
+                    .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                    .collect(),
+                _ => bytemuck::cast_slice(values).to_vec(),
+            }
+        };
+
+        let blob = const_bytes(b, "blob", DataType::Uint8, &[half], packed.to_vec())?;
+        let c16 = const_bytes(
+            b,
+            "c16",
+            DataType::Int32,
+            &[1],
+            16i32.to_le_bytes().to_vec(),
+        )?;
+        let codebook = const_bytes(b, "codebook", dtype, &[16], float_bytes(quant_map))?;
+        let scales = const_bytes(
+            b,
+            "absmax",
+            dtype,
+            &[n_blocks as u32, 1],
+            float_bytes(absmax),
+        )?;
+
+        let opts = |tag: &str| OnnxBuilder::labeled_options(&format!("{label}__{tag}"));
+        let x = b
+            .builder
+            .cast_with_options(blob, map_ast_data_type(DataType::Int32)?, opts("i32"))
+            .map_err(map_op_error)?;
+        let hi = b
+            .builder
+            .div_with_options(x, c16, opts("hi"))
+            .map_err(map_op_error)?;
+        let hi16 = b
+            .builder
+            .mul_with_options(hi, c16, opts("hi16"))
+            .map_err(map_op_error)?;
+        let lo = b
+            .builder
+            .sub_with_options(x, hi16, opts("lo"))
+            .map_err(map_op_error)?;
+        let column = i64_slice_to_mldim(&[i64::from(half), 1])?;
+        let hi = reshape_with_shape(b, hi, &format!("{label}__hi_col"), column.clone())?;
+        let lo = reshape_with_shape(b, lo, &format!("{label}__lo_col"), column)?;
+        // Element 2i is the high nibble, 2i+1 the low nibble.
+        let codes = b
+            .builder
+            .concat_with_options(&[hi, lo], 1, opts("codes"))
+            .map_err(map_op_error)?;
+        let codes = reshape_with_shape(
+            b,
+            codes,
+            &format!("{label}__codes_flat"),
+            i64_slice_to_mldim(&[total as i64])?,
+        )?;
+        let values = b
+            .builder
+            .gather_with_options(
+                codebook,
+                codes,
+                MLGatherOptions {
+                    label: format!("{label}__lookup"),
+                    axis: 0,
+                },
+            )
+            .map_err(map_op_error)?;
+        let blocked = reshape_with_shape(
+            b,
+            values,
+            &format!("{label}__blocked"),
+            i64_slice_to_mldim(&[n_blocks, block_size])?,
+        )?;
+        let scaled = b
+            .builder
+            .mul_with_options(blocked, scales, opts("scaled"))
+            .map_err(map_op_error)?;
+        let weights_nk = reshape_with_shape(
+            b,
+            scaled,
+            &format!("{label}__weights_nk"),
+            i64_slice_to_mldim(&[n, k])?,
+        )?;
+        let weights = b
+            .builder
+            .transpose_with_options(
+                weights_nk,
+                MLTransposeOptions {
+                    label: format!("{label}__weights_kn"),
+                    permutation: vec![1, 0],
+                },
+            )
+            .map_err(map_op_error)?;
+
+        let a = b.resolve_operand(a_name)?;
+        let out = b
+            .builder
+            .matmul_with_options(a, weights, OnnxBuilder::labeled_options(&label))
+            .map_err(map_op_error)?;
+        if let Some(onnx_out) = node.output.first().filter(|name| !name.is_empty()) {
+            record_node_output(b, onnx_out, &label, out);
+        } else {
+            b.record_operand(&[&label], out);
+        }
+        Ok(ConversionResult::default())
+    }
+
+    fn convert_matmul_bnb4(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+        b: &mut OnnxBuilder<'_, '_, '_>,
+    ) -> Result<ConversionResult, OnnxError> {
+        let inputs = node.input.as_slice();
+        if inputs.len() < 3 {
+            return Err(OnnxError::InvalidShape(format!(
+                "MatMulBnb4 expects 3 inputs (A, B, absmax), got {}",
+                inputs.len()
+            )));
+        }
+
+        let mut k = 0i64;
+        let mut n = 0i64;
+        let mut block_size = 0i64;
+        let mut quant_type = 1i64;
+        for attr in &node.attribute {
+            match attr.name.as_str() {
+                "K" => k = attr.i,
+                "N" => n = attr.i,
+                "block_size" => block_size = attr.i,
+                "quant_type" => quant_type = attr.i,
+                _ => {}
+            }
+        }
+        if k <= 0 || n <= 0 || block_size <= 0 {
+            return Err(OnnxError::InvalidShape(format!(
+                "MatMulBnb4 requires positive K/N/block_size, got K={k} N={n} block_size={block_size}"
+            )));
+        }
+        let quant_map: &[f32; 16] = match quant_type {
+            0 => &FP4_QUANT_MAP,
+            1 => &NF4_QUANT_MAP,
+            other => {
+                return Err(OnnxError::unsupported_op(
+                    format!("MatMulBnb4(quant_type={other})"),
+                    node_name.to_string(),
+                ));
+            }
+        };
+
+        let b_tensor = context
+            .initializers
+            .get(inputs[1].as_str())
+            .copied()
+            .ok_or_else(|| {
+                OnnxError::unsupported_op("MatMulBnb4(non-constant B)", node_name.to_string())
+            })?;
+        if b_tensor.data_type != TensorProto_DataType::Uint8 as i32 {
+            return Err(OnnxError::InvalidShape(format!(
+                "MatMulBnb4 B must be packed uint8, got data_type={}",
+                b_tensor.data_type
+            )));
+        }
+        let absmax_tensor = context
+            .initializers
+            .get(inputs[2].as_str())
+            .copied()
+            .ok_or_else(|| {
+                OnnxError::unsupported_op("MatMulBnb4(non-constant absmax)", node_name.to_string())
+            })?;
+
+        let total = (n as usize)
+            .checked_mul(k as usize)
+            .ok_or_else(|| OnnxError::InvalidShape("MatMulBnb4 N*K overflow".into()))?;
+        let packed = tensor_proto_to_bytes(b_tensor)?;
+        if packed.len() < total.div_ceil(2) {
+            return Err(OnnxError::InvalidShape(format!(
+                "MatMulBnb4 B holds {} bytes, need {} for N*K={total} nibbles",
+                packed.len(),
+                total.div_ceil(2)
+            )));
+        }
+        let absmax = decode_float_tensor_as_f32(absmax_tensor)?;
+        let n_blocks = total.div_ceil(block_size as usize);
+        if absmax.len() < n_blocks {
+            return Err(OnnxError::InvalidShape(format!(
+                "MatMulBnb4 absmax holds {} values, need {n_blocks}",
+                absmax.len()
+            )));
+        }
+
+        // Dense fallback below only when the weight is not a whole number of blocks.
+        if total % block_size as usize == 0 {
+            return self.convert_matmul_bnb4_packed(
+                node,
+                node_name,
+                context,
+                b,
+                &packed[..total.div_ceil(2)],
+                quant_map,
+                &absmax[..n_blocks],
+                n,
+                k,
+                block_size,
+            );
+        }
+
+        // B is the flattened row-major [N, K] weight; emit it transposed as
+        // [K, N] so the matmul consumes it directly. Element 2i sits in the
+        // high nibble, 2i+1 in the low nibble (bitsandbytes packing).
+        let (n_usize, k_usize) = (n as usize, k as usize);
+        let mut weights_kn = vec![0f32; total];
+        for idx in 0..total {
+            let byte = packed[idx / 2];
+            let code = if idx % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+            let value = quant_map[code as usize] * absmax[idx / block_size as usize];
+            let (row, col) = (idx / k_usize, idx % k_usize);
+            weights_kn[col * n_usize + row] = value;
+        }
+
+        let label = output_label(node, node_name);
+        let a = b.resolve_operand(&inputs[0])?;
+        let a_is_f16 = matches!(
+            context.value_types.get(inputs[0].as_str()),
+            Some(DataType::Float16)
+        );
+        let weights_name = format!("{label}__weights_kn");
+        let weight_shape = [k as u32, n as u32];
+        if a_is_f16 {
+            let bytes: Vec<u8> = weights_kn
+                .iter()
+                .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                .collect();
+            b.register_constant_from_bytes(&weights_name, DataType::Float16, &weight_shape, bytes)?;
+        } else {
+            b.register_constant_from_bytes(
+                &weights_name,
+                DataType::Float32,
+                &weight_shape,
+                bytemuck::cast_slice(&weights_kn).to_vec(),
+            )?;
+        }
+        let weights = b.resolve_operand(&weights_name)?;
+
+        let out = b
+            .builder
+            .matmul_with_options(a, weights, OnnxBuilder::labeled_options(&label))
+            .map_err(map_op_error)?;
+        if let Some(onnx_out) = node.output.first().filter(|name| !name.is_empty()) {
+            record_node_output(b, onnx_out, &label, out);
+        }
+        Ok(ConversionResult::default())
+    }
+
+    /// Lower `MatMulInteger` as centered float matmul, mirroring `ConvInteger`:
+    /// cast both operands to float32, subtract their zero points, `matmul`,
+    /// and cast the product back to `int32`.
+    fn convert_matmul_integer(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+        b: &mut OnnxBuilder<'_, '_, '_>,
+    ) -> Result<ConversionResult, OnnxError> {
+        let inputs = node.input.as_slice();
+        if inputs.len() < 2 || inputs.len() > 4 {
+            return Err(OnnxError::InvalidShape(format!(
+                "MatMulInteger expects 2 to 4 inputs (A, B[, a_zero_point, b_zero_point]), got {}",
+                inputs.len()
+            )));
+        }
+
+        let output_name = output_label(node, node_name);
+        let a = self.centered_integer_operand(
+            b,
+            &inputs[0],
+            inputs
+                .get(2)
+                .filter(|name| !name.is_empty())
+                .map(String::as_str),
+            context,
+            // A per-row zero point [M] must become [M, 1] to broadcast over K.
+            Some(&[-1, 1]),
+            &format!("{output_name}_a"),
+        )?;
+        let b_in = self.centered_integer_operand(
+            b,
+            &inputs[1],
+            inputs
+                .get(3)
+                .filter(|name| !name.is_empty())
+                .map(String::as_str),
+            context,
+            // B per-column zero point [N] already aligns with the trailing dim.
+            None,
+            &format!("{output_name}_b"),
+        )?;
+
+        let product = b
+            .builder
+            .matmul_with_options(
+                a,
+                b_in,
+                OnnxBuilder::labeled_options(&format!("{output_name}_matmul")),
+            )
+            .map_err(map_op_error)?;
+        let out = b
+            .builder
+            .cast_with_options(
+                product,
+                MLOperandDataType::Int32,
+                OnnxBuilder::labeled_options(&output_name),
+            )
+            .map_err(map_op_error)?;
+
+        let mut result = ConversionResult::default();
+        if let Some(onnx_out) = node.output.first() {
+            record_node_output(b, onnx_out, &output_name, out);
+            result
+                .output_types
+                .insert(onnx_out.clone(), DataType::Int32);
+        } else {
+            b.record_operand(&[&output_name], out);
+        }
+        Ok(result)
+    }
+
+    /// Lower a constant-initializer quantized operand as
+    /// `dequantizeLinear(x, scale = 1.0, zeroPoint)` instead of
+    /// `cast(x) - cast(zp)`. Same arithmetic, but the dequantize-of-constant
+    /// pattern is what backends recognize as weight decompression: CoreML
+    /// lowers it to `constexpr_affine_dequantize` and keeps the weight packed
+    /// through Espresso's compile instead of folding a dense float copy.
+    ///
+    /// Returns `None` (caller falls back to cast+sub) when the operand is not
+    /// a u8/i8 initializer, or when a vector zero point can't be re-registered
+    /// rank-aligned (non-2-D weight). `vector_zp_shape` carries the caller's
+    /// zero-point orientation: `Some(&[-1, 1])` marks a per-row zero point
+    /// (rows axis), `None` a per-column one (trailing axis).
+    fn dequantized_constant_operand(
+        &self,
+        b: &mut OnnxBuilder<'_, '_, '_>,
+        operand_name: &str,
+        zero_point_name: Option<&str>,
+        context: &ConversionContext,
+        vector_zp_shape: Option<&[i64]>,
+        label: &str,
+    ) -> Result<Option<MLOperand>, OnnxError> {
+        let Some(tensor) = context.initializers.get(operand_name) else {
+            return Ok(None);
+        };
+        if !matches!(
+            map_onnx_data_type(tensor.data_type),
+            Ok(DataType::Uint8 | DataType::Int8)
+        ) {
+            return Ok(None);
+        }
+        let zp_dtype = map_onnx_data_type(tensor.data_type)?;
+        let x = b.resolve_operand(operand_name)?;
+
+        // Zero point layout decides the scale/zeroPoint shape. Scalars (or
+        // absent zero points) pair with a scalar 1.0 scale; a per-column
+        // vector [N] on a 2-D weight [K, N] is re-registered rank-aligned as
+        // [1, N] so WebNN's blockwise rules (and the CoreML per-channel axis
+        // derivation) see an unambiguous axis.
+        let zp_tensor = match zero_point_name {
+            Some(name) => match context.initializers.get(name) {
+                Some(t) if map_onnx_data_type(t.data_type).ok() == Some(zp_dtype.clone()) => {
+                    Some(*t)
+                }
+                _ => return Ok(None),
+            },
+            None => None,
+        };
+        let zp_len = zp_tensor
+            .map(|t| t.dims.iter().product::<i64>().max(1))
+            .unwrap_or(1);
+        let zp_is_vector = zp_tensor.is_some_and(|t| t.dims.len() == 1 && t.dims[0] > 1);
+        if zp_len > 1 && !zp_is_vector {
+            // Multi-element zero point that is not a plain 1-D vector (e.g.
+            // already rank-aligned): keep the cast+sub fallback.
+            return Ok(None);
+        }
+
+        let (const_shape, ones_len): (Vec<u32>, usize) = if zp_is_vector {
+            // Per-row ([-1, 1] template) pins the zero point to axis 0,
+            // per-column (no template) to the trailing axis of a 2-D tensor.
+            let (shape, tensor_axis) = match vector_zp_shape {
+                Some([-1, 1]) => (vec![zp_len as u32, 1], 0),
+                None => (vec![1, zp_len as u32], 1),
+                _ => return Ok(None),
+            };
+            if tensor.dims.len() != 2 || tensor.dims[tensor_axis] != zp_len {
+                return Ok(None);
+            }
+            (shape, zp_len as usize)
+        } else {
+            (vec![], 1)
+        };
+
+        let scale_name = format!("{label}_dq_scale");
+        let ones: Vec<u8> = std::iter::repeat(1.0f32.to_le_bytes())
+            .take(ones_len)
+            .flatten()
+            .collect();
+        b.register_constant_from_bytes(&scale_name, DataType::Float32, &const_shape, ones)?;
+        let scale = b.resolve_operand(&scale_name)?;
+
+        let zp_name = format!("{label}_dq_zp");
+        let zp_bytes = match zp_tensor {
+            Some(t) => tensor_proto_to_bytes(t)?,
+            None => vec![0u8],
+        };
+        b.register_constant_from_bytes(&zp_name, zp_dtype, &const_shape, zp_bytes)?;
+        let zero_point = b.resolve_operand(&zp_name)?;
+
+        let out = b
+            .builder
+            .dequantize_linear_with_zeropoint(x, scale, zero_point)
+            .map_err(map_op_error)?;
+        Ok(Some(out))
+    }
+
+    /// Cast a quantized operand to float32 and subtract its (optional) zero
+    /// point. `vector_zp_shape` reshapes a 1-D zero point before subtraction;
+    /// `-1` stands for the zero point's own length.
+    fn centered_integer_operand(
+        &self,
+        b: &mut OnnxBuilder<'_, '_, '_>,
+        operand_name: &str,
+        zero_point_name: Option<&str>,
+        context: &ConversionContext,
+        vector_zp_shape: Option<&[i64]>,
+        label: &str,
+    ) -> Result<MLOperand, OnnxError> {
+        if let Some(out) = self.dequantized_constant_operand(
+            b,
+            operand_name,
+            zero_point_name,
+            context,
+            vector_zp_shape,
+            label,
+        )? {
+            return Ok(out);
+        }
+        let operand = b.resolve_operand(operand_name)?;
+        let as_float = b
+            .builder
+            .cast_with_options(
+                operand,
+                MLOperandDataType::Float32,
+                OnnxBuilder::labeled_options(&format!("{label}_float")),
+            )
+            .map_err(map_op_error)?;
+        let Some(zero_point_name) = zero_point_name else {
+            return Ok(as_float);
+        };
+
+        let zero_point = b.resolve_operand(zero_point_name)?;
+        let mut zero_point_float = b
+            .builder
+            .cast_with_options(
+                zero_point,
+                MLOperandDataType::Float32,
+                OnnxBuilder::labeled_options(&format!("{label}_zero_point_float")),
+            )
+            .map_err(map_op_error)?;
+
+        if let Some(template) = vector_zp_shape {
+            let zp_shape = lookup_shape(zero_point_name, context);
+            if let Some(zp_shape) = zp_shape.filter(|s| s.len() == 1 && s[0] > 1) {
+                let target: Vec<i64> = template
+                    .iter()
+                    .map(|&d| if d == -1 { zp_shape[0] } else { d })
+                    .collect();
+                zero_point_float = reshape_with_shape(
+                    b,
+                    zero_point_float,
+                    &format!("{label}_zero_point_reshape"),
+                    i64_slice_to_mldim(&target)?,
+                )?;
+            }
+        }
+
+        b.builder
+            .sub_with_options(
+                as_float,
+                zero_point_float,
+                OnnxBuilder::labeled_options(&format!("{label}_centered")),
+            )
+            .map_err(map_op_error)
+    }
+
+    /// Lower `com.microsoft.MatMulNBits` the same way ORT's WebNN EP does:
+    /// `dequantizeLinear` -> reshape `[N,K]` -> transpose `[K,N]` -> `matmul` (+ optional bias).
+    ///
+    /// Supported: bits=4, constant packed `B`, constant `scales`, optional constant
+    /// zero_points, optional bias.
+    /// Rejected: bits!=4, `g_idx`, non-constant `B`/`scales`/`zero_points`.
     fn convert_matmul_nbits(
         &self,
         node: &NodeProto,
@@ -171,15 +791,15 @@ impl MatMulHandler {
                 _ => {}
             }
         }
-        if bits != 4 {
+        if bits != 4 && bits != 8 {
             return Err(OnnxError::unsupported_op(
                 format!("MatMulNBits(bits={bits})"),
                 node_name.to_string(),
             ));
         }
-        if k <= 0 || n <= 0 || block_size < 16 || !block_size.is_power_of_two() {
+        if k <= 0 || n <= 0 || block_size < 16 || !(block_size as u64).is_power_of_two() {
             return Err(OnnxError::InvalidShape(format!(
-                "MatMulNBits requires positive K/N and power-of-two block_size≥16, \
+                "MatMulNBits requires positive K/N and power-of-two block_size>=16, \
                  got K={k} N={n} block_size={block_size}"
             )));
         }
@@ -202,10 +822,7 @@ impl MatMulHandler {
             .map(String::as_str);
 
         let b_tensor = context.initializers.get(b_name).copied().ok_or_else(|| {
-            OnnxError::unsupported_op(
-                "MatMulNBits(non-constant B)",
-                node_name.to_string(),
-            )
+            OnnxError::unsupported_op("MatMulNBits(non-constant B)", node_name.to_string())
         })?;
         if b_tensor.data_type != TensorProto_DataType::Uint8 as i32 {
             return Err(OnnxError::InvalidShape(format!(
@@ -236,7 +853,7 @@ impl MatMulHandler {
                 "MatMulNBits n_blocks {n_blocks} != ceil(K/block_size)={expected_blocks}"
             )));
         }
-        let expected_blob = (block_size_u * 4).div_ceil(8);
+        let expected_blob = (block_size_u * bits as u32).div_ceil(8);
         if blob_size != expected_blob {
             return Err(OnnxError::InvalidShape(format!(
                 "MatMulNBits blob_size {blob_size} != block_size*bits/8={expected_blob}"
@@ -245,24 +862,34 @@ impl MatMulHandler {
 
         let label = output_label(node, node_name);
         let packed = tensor_proto_to_bytes(b_tensor)?;
-        // Reinterpret packed uint8 blobs as uint4 with doubled last dim (= block_size).
-        let uint4_shape = [n_attr, n_blocks, blob_size * 2];
-        let b_uint4_name = format!("{label}__B_uint4");
-        b.register_constant_from_bytes(
-            &b_uint4_name,
-            DataType::Uint4,
-            &uint4_shape,
-            &packed,
-        )?;
+        // 4-bit: reinterpret packed blobs as uint4 with doubled last dim
+        // (= block_size); 8-bit blobs are already one value per byte.
+        let (weight_dtype, weight_shape) = if bits == 4 {
+            (DataType::Uint4, [n_attr, n_blocks, blob_size * 2])
+        } else {
+            (DataType::Uint8, [n_attr, n_blocks, blob_size])
+        };
+        let b_uint4_name = format!("{label}__B_quant");
+        b.register_constant_from_bytes(&b_uint4_name, weight_dtype, &weight_shape, packed)?;
         let b_uint4 = b.resolve_operand(&b_uint4_name)?;
 
-        let scales = b.resolve_operand(scales_name)?;
-        let scales = reshape_with_shape(
-            b,
-            scales,
-            &format!("{label}__scales"),
-            i64_slice_to_mldim(&[n, n_blocks as i64, 1])?,
+        let scales_tensor = context
+            .initializers
+            .get(scales_name)
+            .copied()
+            .ok_or_else(|| {
+                OnnxError::unsupported_op("MatMulNBits(non-constant scales)", node_name.to_string())
+            })?;
+        let scales_dtype = map_onnx_data_type(scales_tensor.data_type)?;
+        let scales_bytes = tensor_proto_to_bytes(scales_tensor)?;
+        let scales_shape_name = format!("{label}__scales");
+        b.register_constant_from_bytes(
+            &scales_shape_name,
+            scales_dtype,
+            &[n_attr, n_blocks, 1],
+            scales_bytes,
         )?;
+        let scales = b.resolve_operand(&scales_shape_name)?;
 
         let zero_point = register_matmul_nbits_zero_point(
             b,
@@ -270,6 +897,7 @@ impl MatMulHandler {
             zero_points_name,
             n_attr,
             n_blocks,
+            bits,
             &format!("{label}__zero_point"),
         )?;
 
@@ -277,12 +905,35 @@ impl MatMulHandler {
             .builder
             .dequantize_linear_with_zeropoint(b_uint4, scales, zero_point)
             .map_err(map_op_error)?;
-        let weights = reshape_with_shape(
-            b,
-            dequantized,
-            &format!("{label}__weights_nk"),
-            i64_slice_to_mldim(&[n, k])?,
-        )?;
+        // The last block may be zero-padded (K not a multiple of block_size,
+        // e.g. K=8 with block_size=32): reshape to the padded width and slice
+        // the valid K columns before use.
+        let padded_k = (n_blocks * block_size_u) as i64;
+        let weights = if padded_k != k {
+            let padded = reshape_with_shape(
+                b,
+                dequantized,
+                &format!("{label}__weights_nk_padded"),
+                i64_slice_to_mldim(&[n, padded_k])?,
+            )?;
+            slice_with_params(
+                b,
+                padded,
+                &format!("{label}__weights_nk"),
+                &[0, 0],
+                &[
+                    rustnn::operator_options::MLDimension::Static(n_attr),
+                    rustnn::operator_options::MLDimension::Static(k_attr),
+                ],
+            )?
+        } else {
+            reshape_with_shape(
+                b,
+                dequantized,
+                &format!("{label}__weights_nk"),
+                i64_slice_to_mldim(&[n, k])?,
+            )?
+        };
         let weights = b
             .builder
             .transpose_with_options(
@@ -324,20 +975,23 @@ fn register_matmul_nbits_zero_point(
     zero_points_name: Option<&str>,
     n: u32,
     n_blocks: u32,
+    bits: i64,
     label: &str,
 ) -> Result<MLOperand, OnnxError> {
     let zp_shape = [n, n_blocks, 1];
     let element_count = (n as usize)
         .checked_mul(n_blocks as usize)
         .ok_or_else(|| OnnxError::InvalidShape("MatMulNBits zero_point size overflow".into()))?;
-    let packed_len = element_count.div_ceil(2);
+    // 4-bit zero points are packed two per byte; 8-bit are one per byte.
+    let (packed_len, default_byte, zp_dtype) = if bits == 4 {
+        (element_count.div_ceil(2), 0x88u8, DataType::Uint4)
+    } else {
+        (element_count, 0x80u8, DataType::Uint8)
+    };
 
     let packed = if let Some(name) = zero_points_name {
         let tensor = context.initializers.get(name).copied().ok_or_else(|| {
-            OnnxError::unsupported_op(
-                "MatMulNBits(non-constant zero_points)",
-                label.to_string(),
-            )
+            OnnxError::unsupported_op("MatMulNBits(non-constant zero_points)", label.to_string())
         })?;
         if tensor.data_type != TensorProto_DataType::Uint8 as i32 {
             return Err(OnnxError::InvalidShape(format!(
@@ -354,11 +1008,10 @@ fn register_matmul_nbits_zero_point(
         }
         bytes
     } else {
-        // Default uint4 zero point is 8 → packed nibbles 0x88.
-        vec![0x88u8; packed_len]
+        vec![default_byte; packed_len]
     };
 
-    b.register_constant_from_bytes(label, DataType::Uint4, &zp_shape, &packed)?;
+    b.register_constant_from_bytes(label, zp_dtype, &zp_shape, packed)?;
     b.resolve_operand(label)
 }
 
@@ -429,8 +1082,8 @@ mod tests {
             },
         ];
 
-        // B: [N=16, n_blocks=1, blob_size=16] packed uint8 (= 256 uint4 values).
-        let values: Vec<u8> = (0..256).map(|v| (v % 16) as u8).collect();
+        // B: [N=16, n_blocks=1, blob_size=16] packed uint8 (= 512 uint4 values).
+        let values: Vec<u8> = (0..512).map(|v| (v % 16) as u8).collect();
         let packed = pack_uint4(&values);
         let b_tensor = TensorProto {
             name: "b_q4".to_string(),
@@ -439,9 +1092,7 @@ mod tests {
             raw_data: packed,
             ..Default::default()
         };
-        let scale_bytes: Vec<u8> = (0..16)
-            .flat_map(|_| 0.5f32.to_le_bytes())
-            .collect();
+        let scale_bytes: Vec<u8> = (0..16).flat_map(|_| 0.5f32.to_le_bytes()).collect();
         let scales = TensorProto {
             name: "scales".to_string(),
             data_type: TensorProto_DataType::Float as i32,
@@ -480,8 +1131,11 @@ mod tests {
     #[test]
     fn rejects_matmul_nbits_with_g_idx() {
         let handler = MatMulHandler;
-        let mut node =
-            create_test_node("MatMulNBits", vec!["a", "b", "scales", "", "g_idx"], vec!["y"]);
+        let mut node = create_test_node(
+            "MatMulNBits",
+            vec!["a", "b", "scales", "", "g_idx"],
+            vec!["y"],
+        );
         node.attribute = vec![
             AttributeProto {
                 name: "K".to_string(),
@@ -505,6 +1159,6 @@ mod tests {
             },
         ];
         let err = crate::onnx::ops::convert_with_test_builder(&handler, &node).unwrap_err();
-        assert!(matches!(err, OnnxError::UnsupportedOp { .. }));
+        assert!(matches!(err, OnnxError::UnsupportedOps(_)));
     }
 }

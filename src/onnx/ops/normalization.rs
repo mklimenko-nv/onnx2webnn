@@ -826,7 +826,7 @@ fn register_f32_scalar(
     name: &str,
     value: f32,
 ) -> Result<MLOperand, OnnxError> {
-    b.register_constant_from_bytes(name, DataType::Float32, &[1], &value.to_le_bytes())?;
+    b.register_constant_from_bytes(name, DataType::Float32, &[1], value.to_le_bytes().to_vec())?;
     b.resolve_operand(name)
 }
 
@@ -839,7 +839,12 @@ fn register_scalar_like(
     match data_type {
         DataType::Float16 => {
             let bits = f16::from_f32(value).to_bits();
-            b.register_constant_from_bytes(name, DataType::Float16, &[1], &bits.to_le_bytes())?;
+            b.register_constant_from_bytes(
+                name,
+                DataType::Float16,
+                &[1],
+                bits.to_le_bytes().to_vec(),
+            )?;
             b.resolve_operand(name)
         }
         _ => register_f32_scalar(b, name, value),
@@ -869,7 +874,7 @@ fn axis_position_indices(
     }
     let values: Vec<i64> = (0..axis_dim).collect();
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    b.register_constant_from_bytes(label, DataType::Int64, &[axis_dim as u32], &bytes)?;
+    b.register_constant_from_bytes(label, DataType::Int64, &[axis_dim as u32], bytes)?;
     let one_d = b.resolve_operand(label)?;
 
     let mut broadcast_shape = vec![1i64; shape.len()];

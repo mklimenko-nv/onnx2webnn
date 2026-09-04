@@ -123,7 +123,7 @@ changed at opset 22/25/26.
 | Normalization | LayerNormalization, Softmax | `normalization.rs` |
 | Shape | Reshape, Transpose, Concat, Split, Unsqueeze, Squeeze, Tile, Expand, Flatten | `reshape.rs` |
 | Conversion | Cast, Constant | `conversion.rs` |
-| Utility | Shape, Gather, Slice, ConstantOfShape, Range, Trilu | `utility.rs` |
+| Utility | Shape, Gather, Slice, ConstantOfShape, Range, Trilu, OneHot | `utility.rs` |
 | Reduction | ReduceMean, ReduceSum, ReduceMax, ReduceMin | `reduction.rs` |
 | Activation / unary | Relu, Gelu, Tanh, Sigmoid, Sqrt, Exp, Log, Abs, Neg, Erf, Cos, Sin, Identity | `activation.rs` |
 | Scatter | ScatterND | `scatter.rs` |
@@ -212,7 +212,17 @@ These appear in graphs but become constants or metadata during `--optimize` / co
 | SimplifiedLayerNormalization | Alias of RMSNormalization | Implemented — standard/exporter fusion |
 | SkipSimplifiedLayerNormalization | Residual/bias add + RMSNormalization | Implemented — com.microsoft fusion |
 | RotaryEmbedding | Gather caches + rotate pairs + concatenate | Implemented — standard and com.microsoft |
-| MatMulNBits | uint4 reinterpret + dequantizeLinear + transpose + matmul | Implemented — bits=4; reject g_idx/bits≠4 |
+| MatMulNBits | uint4/uint8 reinterpret + dequantizeLinear + transpose + matmul | Implemented — bits=4/8; reject g_idx |
+| MatMulInteger | centered float `matmul` + `int32` cast (mirrors ConvInteger) | Implemented — scalar or 1-D zero points |
+| Einsum | reduceSum + transpose/reshape + batched `matmul` | Implemented — ≤2 inputs; reject ellipsis/diagonals |
+| MatMulBnb4 | packed uint8 constant, nibbles unpacked with int32 div/sub, codebook `gather`, per-block absmax `mul`, `matmul` | Implemented; weight stays 4-bit in the graph, dense fallback when N*K is not a whole number of blocks |
+| GroupQueryAttention | reshape/transpose + KV-cache concat + scaled matmul + static causal mask + softmax | Implemented — unpadded batch assumption; reject packed QKV/do_rotary/softcap/local window |
+| MoE | dense expert evaluation (batched matmul) + iterative top-k mask + masked softmax blend | Implemented — fused interleaved swiglu/relu/gelu/sigmoid; reject fc3/sparse mixer; num_experts/k× FLOP overhead |
+| QMoE | uint4/uint8 expert constants with blockwise `dequantizeLinear`, then the MoE lowering | Implemented; same restrictions as MoE, dense fallback when `in` is not a whole number of blocks |
+| GatherBlockQuantized | `gather` packed rows, scales and zero points, unpack nibbles, `dequantizeLinear` on the gathered slice | Implemented; 2-D tables along axis 0 (uint8, INT4, UINT4), other layouts dequantize at conversion time |
+| SplitToSequence + SequenceAt | per-element slices registered as pseudo-operands, SequenceAt aliases by constant index | Implemented — torch split() export pattern; sequence graph outputs rejected |
+| If (constant condition) | branch inlined into the outer graph before conversion; a boolean graph input gate (optimum's `use_cache_branch`) becomes constant via `--pin-input` | Implemented — data-dependent conditions remain unsupported |
+| LSTM/GRU (direction=bidirectional/reverse) | WebNN native direction support + [dirs,...] bias split and Y layout | Implemented — LSTM initial_h/initial_c wired; sequence_lens/peephole rejected |
 | CumProd | `cumulativeSum` on log + `Exp`, or iterative multiply subgraph | P3 — new in opset 26 |
 
 #### 2c. Advanced single-entry WebNN ops (high attribute complexity)
@@ -290,7 +300,7 @@ vs inference export).
 
 | Operators | Reason |
 |-----------|--------|
-| MatMulInteger, QLinearConv, QLinearMatMul | Integer matmul / fused quantized ops not in WebNN; use explicit float + quantization decomposition |
+| QLinearConv, QLinearMatMul | Fused quantized ops not in WebNN; use explicit float + quantization decomposition. `MatMulInteger` is now implemented via centered float matmul |
 
 `ConvInteger` is supported through centered float `conv2d` followed by an `int32` cast,
 `DynamicQuantizeLinear` is decomposed into reductions, scale/zero-point arithmetic, and WebNN
@@ -307,7 +317,7 @@ vs inference export).
 
 | Operators | Reason |
 |-----------|--------|
-| Einsum, Det | No general contraction or determinant in WebNN |
+| Det | No determinant in WebNN. `Einsum` is now implemented for one/two-input equations without ellipsis or repeated per-term labels (lowered to reduceSum/transpose/reshape/matmul) |
 
 #### 3k. Indexing and sorting extras
 
@@ -336,7 +346,7 @@ vs inference export).
 
 | Strategy | When | Example |
 |----------|------|---------|
-| Reject | No WebNN op and not foldable | If, Loop, Einsum, Attention |
+| Reject | No WebNN op and not foldable | If, Loop, Attention |
 | Pre-fold / strip | Training artifact in inference export | Dropout → Identity |
 | Document workaround | Rare; manual graph rewrite | Replace TopK with external post-process |
 

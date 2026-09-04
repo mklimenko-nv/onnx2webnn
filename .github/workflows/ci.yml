@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main, transformers]
+  pull_request:
+    branches: [main, transformers]
+
+env:
+  # ONNX Runtime dylib for the reference backend. rustnn pins ort 2.0.0-rc.13
+  # with the `api-27` feature, so this must be >= 1.27 (any newer 1.x works).
+  ORT_VERSION: 1.29.0
+  # rustnn checkout. Pinned to the fork branch carrying (a) the ONNX exporter
+  # fixes (Squeeze axes, f16 casts, bidirectional LSTM/GRU) and (b) the CoreML
+  # fixes the macOS --release + --features coreml job requires (ARC
+  # __bridge_retained ownership in compile/load/predict, converter gaps).
+  # Do not switch back to rustnn/rustnn @ main until BOTH have landed upstream
+  # (rustnn/rustnn#219).
+  RUSTNN_REPO: mklimenko-nv/rustnn
+  RUSTNN_REF: private/mklimenko/onnx2webnn-fixes
+
+jobs:
+  test:
+    name: Build & Test (${{ matrix.os }}${{ matrix.cargo_flags && ', coreml' || '' }})
+    runs-on: ${{ matrix.os }}
+    # The CoreML job dispatches every integration test through Apple's CoreML
+    # backend; op coverage there may lag the ORT backend, so it reports
+    # without blocking until it has a green track record.
+    continue-on-error: ${{ matrix.experimental || false }}
+    # The macOS sweep has taken 50+ min when a rustnn regression makes CoreML
+    # compiles pathological; kill runaway jobs instead of holding a runner for
+    # the 6 h default.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            ort_archive: onnxruntime-linux-x64
+            ort_ext: tgz
+            ort_dylib: lib/libonnxruntime.so
+          - os: windows-latest
+            ort_archive: onnxruntime-win-x64
+            ort_ext: zip
+            ort_dylib: lib/onnxruntime.dll
+          - os: macos-latest
+            ort_archive: onnxruntime-osx-arm64
+            ort_ext: tgz
+            ort_dylib: lib/libonnxruntime.dylib
+            # rustnn selects the CoreML backend automatically on macOS when
+            # the feature is compiled in (ORT still serves as the reference).
+            cargo_flags: --features coreml
+            experimental: true
+            # CoreML graph compiles peak at ~5 GB for the largest sweep
+            # entries; two in flight exceed the 7 GB macOS runner and it
+            # falls into memory-compression/swap churn.
+            model_test_jobs: 1
+    defaults:
+      run:
+        shell: bash
+        working-directory: onnx2webnn
+    steps:
+      # rustnn contains paths longer than Windows' 260-char MAX_PATH.
+      - name: Enable git long paths (Windows)
+        if: runner.os == 'Windows'
+        working-directory: ${{ github.workspace }}
+        run: git config --system core.longpaths true
+
+      - name: Checkout onnx2webnn
+        uses: actions/checkout@v4
+        with:
+          path: onnx2webnn
+
+      # Cargo.toml references rustnn as a sibling path dependency (../rustnn).
+      - name: Checkout rustnn
+        id: rustnn
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RUSTNN_REPO }}
+          ref: ${{ env.RUSTNN_REF }}
+          path: rustnn
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # rustnn's build.rs compiles CoreML protos with prost-build, which needs protoc.
+      - name: Install protobuf compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The registry cache only depends on Cargo.lock, but target/ must also
+      # key on the rustnn commit: sources are checked out BEFORE the cache is
+      # restored, so a stale target/ has newer fingerprints than the fresh
+      # rustnn sources and cargo silently skips rebuilding the path dependency.
+      # No restore-keys for target/ for the same reason — only an exact match
+      # is safe.
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('onnx2webnn/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: onnx2webnn/target
+          key: ${{ runner.os }}-target-${{ hashFiles('onnx2webnn/Cargo.lock') }}-${{ steps.rustnn.outputs.commit }}
+
+      - name: Download ONNX Runtime ${{ env.ORT_VERSION }}
+        run: |
+          archive="${{ matrix.ort_archive }}-${ORT_VERSION}"
+          url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${archive}.${{ matrix.ort_ext }}"
+          mkdir -p "$RUNNER_TEMP/ort"
+          curl -sSL "$url" -o "$RUNNER_TEMP/ort/archive.${{ matrix.ort_ext }}"
+          if [ "${{ matrix.ort_ext }}" = "zip" ]; then
+            unzip -q "$RUNNER_TEMP/ort/archive.zip" -d "$RUNNER_TEMP/ort"
+          else
+            tar -xzf "$RUNNER_TEMP/ort/archive.tgz" -C "$RUNNER_TEMP/ort"
+          fi
+          dylib="$RUNNER_TEMP/ort/${archive}/${{ matrix.ort_dylib }}"
+          # Linux/macOS release tarballs may ship only a versioned library.
+          if [ ! -f "$dylib" ]; then
+            dylib="$(ls "$RUNNER_TEMP/ort/${archive}"/lib/libonnxruntime.*.dylib \
+                       "$RUNNER_TEMP/ort/${archive}"/lib/libonnxruntime.so.* 2>/dev/null | head -1)"
+          fi
+          echo "ORT_DYLIB_PATH=$dylib" >> "$GITHUB_ENV"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build
+        run: cargo build --release --locked ${{ matrix.cargo_flags }}
+
+      # tests/model_skeletons.rs converts the transformers.js exports in
+      # tests/models/manifest.json. With CI set it builds weight-stripped
+      # skeletons from the Hugging Face Hub with range requests (graph and
+      # small constants only) and keeps them in target/model-skeletons; the
+      # ~40 MB cache spares the Hub on later runs until the manifest or the
+      # scanner changes.
+      - name: Cache model skeletons
+        uses: actions/cache@v4
+        with:
+          path: onnx2webnn/target/model-skeletons
+          key: model-skeletons-${{ hashFiles('onnx2webnn/tests/models/manifest.json', 'onnx2webnn/tests/common/skeleton.rs') }}
+
+      - name: Test
+        # Hosted runners have 4 cores and 7-16 GB; the heavy sweep entries
+        # (multi-GB weights) need more than that and are skipped.
+        env:
+          # Optional; raises Hub rate limits if the repository defines it.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          O2W_MODEL_TEST_JOBS: ${{ matrix.model_test_jobs || 2 }}
+          O2W_MODEL_TEST_SKIP_HEAVY: 1
+        run: cargo test --release --locked ${{ matrix.cargo_flags }}

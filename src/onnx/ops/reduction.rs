@@ -122,24 +122,41 @@ impl ReductionHandler {
         for attr in node.attribute.as_slice() {
             match attr.name.as_str() {
                 "axes" if !attr.ints.is_empty() => axes = Some(attr.ints.clone()),
-                "keepdims" if attr.i != 0 => keepdims = attr.i,
+                "keepdims" => keepdims = attr.i,
                 _ => {}
+            }
+        }
+        // Opset 18+ moved reduce axes from an attribute to a constant input.
+        if axes.is_none() {
+            if let Some(axes_name) = inputs.get(1).filter(|n| !n.is_empty()) {
+                axes = context
+                    .const_values
+                    .get(axes_name.as_str())
+                    .cloned()
+                    .filter(|v| !v.is_empty());
             }
         }
 
         let output_name = output_label(node, node_name);
         let input = b.resolve_operand(&inputs[0])?;
 
-        let axes_u32 = axes.map(|axes_values| {
-            if let Some(rank) = context.input_rank(inputs[0].as_str()) {
-                normalize_axes_best_effort(&axes_values, rank)
-            } else {
-                axes_values
-            }
-            .into_iter()
-            .map(|a| a as u32)
-            .collect::<Vec<_>>()
-        });
+        let axes_u32 = axes
+            .map(|axes_values| {
+                let normalized = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
+                    normalize_axes_best_effort(&axes_values, rank)
+                } else {
+                    axes_values
+                };
+                if normalized.iter().any(|&a| a < 0) {
+                    return Err(OnnxError::InvalidShape(format!(
+                        "{} '{node_name}' has negative reduce axes {normalized:?} but the \
+                         input rank is unknown",
+                        node.op_type
+                    )));
+                }
+                Ok(normalized.into_iter().map(|a| a as u32).collect::<Vec<_>>())
+            })
+            .transpose()?;
 
         let opts = MLReduceOptions {
             label: output_name.clone(),

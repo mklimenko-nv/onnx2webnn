@@ -143,6 +143,17 @@ pub(crate) fn map_onnx_data_type(onnx_type: i32) -> Result<DataType, OnnxError> 
     if onnx_type == TensorProto_DataType::Bool as i32 {
         return Ok(DataType::Uint8);
     }
+    // WebNN has no float64; double tensors are lowered to float32.
+    if onnx_type == TensorProto_DataType::Double as i32 {
+        return Ok(DataType::Float32);
+    }
+    // Packed 4-bit tensors (ONNX 1.16+): UINT4 = 21, INT4 = 22.
+    if onnx_type == 21 {
+        return Ok(DataType::Uint4);
+    }
+    if onnx_type == 22 {
+        return Ok(DataType::Int4);
+    }
 
     let utils_dtype = utils_data_types::onnx_to_webnn(onnx_type)?;
     Ok(match utils_dtype {
@@ -157,7 +168,7 @@ pub(crate) fn map_onnx_data_type(onnx_type: i32) -> Result<DataType, OnnxError> 
     })
 }
 
-/// Conversion options for ONNX → MLGraphBuilder lowering + ORT validation.
+/// Conversion options for ONNX -> MLGraphBuilder lowering + ORT validation.
 #[derive(Debug, Clone, Default)]
 pub struct ConvertOptions {
     /// Override dynamic dimension values (e.g., batch_size=1, sequence_length=128)
@@ -166,6 +177,243 @@ pub struct ConvertOptions {
     pub optimize: bool,
     /// Experimental: preserve unresolved dynamic input dimensions in graph metadata
     pub experimental_dynamic_inputs: bool,
+    /// Graph inputs frozen to a constant (e.g. `use_cache_branch=false`),
+    /// turning runtime `If` gates into constant ones that can be inlined.
+    pub pinned_inputs: HashMap<String, i64>,
+    /// Zero-fill external tensors whose data file is missing. Lets a
+    /// weight-stripped "skeleton" model exercise the full conversion and ORT
+    /// graph build (values never matter for graph structure).
+    pub zero_fill_missing_external_data: bool,
+}
+
+/// Parse a `--pin-input NAME=VALUE` argument (`true`/`false` or an integer).
+pub fn parse_pinned_input(spec: &str) -> Result<(String, i64), OnnxError> {
+    let (name, value) = spec.split_once('=').ok_or_else(|| {
+        OnnxError::InvalidShape(format!(
+            "Invalid pin-input format: '{spec}'. Expected NAME=VALUE"
+        ))
+    })?;
+    let value = match value.trim() {
+        "true" => 1,
+        "false" => 0,
+        v => v.parse::<i64>().map_err(|_| {
+            OnnxError::InvalidShape(format!(
+                "Invalid pin-input value '{v}' for '{name}': expected true/false or an integer"
+            ))
+        })?,
+    };
+    Ok((name.trim().to_string(), value))
+}
+
+/// Replace the named graph inputs with constant initializers of the declared
+/// type and (static) shape, so constant folding and `If` inlining treat them
+/// as constants.
+pub fn pin_graph_inputs(
+    model: &mut ModelProto,
+    pinned: &HashMap<String, i64>,
+) -> Result<(), OnnxError> {
+    if pinned.is_empty() {
+        return Ok(());
+    }
+    let graph = model
+        .graph
+        .as_mut()
+        .ok_or_else(|| OnnxError::InvalidShape("model has no graph".to_string()))?;
+    for (name, &value) in pinned {
+        let idx = graph
+            .input
+            .iter()
+            .position(|vi| vi.name == *name)
+            .ok_or_else(|| {
+                OnnxError::InvalidShape(format!("pin-input: '{name}' is not a graph input"))
+            })?;
+        let vi = graph.input.remove(idx);
+        let Some(TypeProtoValue::TensorType(tt)) =
+            vi.r#type.as_ref().and_then(|t| t.value.as_ref())
+        else {
+            return Err(OnnxError::InvalidShape(format!(
+                "pin-input: '{name}' is not a tensor input"
+            )));
+        };
+        let dims: Vec<i64> = match tt.shape.as_ref() {
+            Some(shape) => shape
+                .dim
+                .iter()
+                .map(|d| match d.value.as_ref() {
+                    Some(DimensionValue::DimValue(v)) => Ok(*v),
+                    _ => Err(OnnxError::InvalidShape(format!(
+                        "pin-input: '{name}' has a dynamic dimension; only static shapes can be pinned"
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
+        let numel: usize = dims.iter().product::<i64>().max(1) as usize;
+        let elem_type = tt.elem_type;
+        let raw_data: Vec<u8> = if elem_type == TensorProto_DataType::Bool as i32 {
+            vec![u8::from(value != 0); numel]
+        } else if elem_type == TensorProto_DataType::Int64 as i32 {
+            value.to_le_bytes().repeat(numel)
+        } else if elem_type == TensorProto_DataType::Int32 as i32 {
+            (value as i32).to_le_bytes().repeat(numel)
+        } else if elem_type == TensorProto_DataType::Float as i32 {
+            (value as f32).to_le_bytes().repeat(numel)
+        } else {
+            return Err(OnnxError::InvalidShape(format!(
+                "pin-input: unsupported element type {elem_type} for '{name}' (bool, int32, int64, float)"
+            )));
+        };
+        graph.initializer.push(crate::protos::onnx::TensorProto {
+            name: name.clone(),
+            data_type: elem_type,
+            dims,
+            raw_data,
+            ..Default::default()
+        });
+    }
+    Ok(())
+}
+
+/// Drop graph outputs that are zero-size constants (optimum's merged decoders
+/// return dummy `[0, H, 1, D]` encoder KV outputs from the cache branch).
+/// WebNN cannot represent zero-size tensors and they carry no data.
+fn prune_empty_graph_outputs(model: &mut ModelProto) {
+    let Some(graph) = model.graph.as_mut() else {
+        return;
+    };
+    let mut empty_consts: HashSet<String> = graph
+        .initializer
+        .iter()
+        .filter(|t| t.dims.contains(&0))
+        .map(|t| t.name.clone())
+        .collect();
+    for node in graph.node.iter().filter(|n| n.op_type == "Constant") {
+        let is_empty = node.attribute.iter().any(|a| {
+            a.name.as_str() == "value" && a.t.as_ref().is_some_and(|t| t.dims.contains(&0))
+        });
+        if is_empty {
+            empty_consts.extend(node.output.iter().cloned());
+        }
+    }
+    if empty_consts.is_empty() {
+        return;
+    }
+    let before = graph.output.len();
+    graph.output.retain(|o| !empty_consts.contains(&o.name));
+    if graph.output.len() == before {
+        return;
+    }
+    if graph.output.is_empty() {
+        // Keep the model well-formed; conversion reports the empty outputs.
+        return;
+    }
+    let consumed: HashSet<String> = graph
+        .node
+        .iter()
+        .flat_map(|n| n.input.iter().cloned())
+        .chain(graph.output.iter().map(|o| o.name.clone()))
+        .collect();
+    graph
+        .node
+        .retain(|n| n.op_type != "Constant" || n.output.iter().any(|o| consumed.contains(o)));
+    graph
+        .initializer
+        .retain(|t| !t.dims.contains(&0) || consumed.contains(&t.name));
+    crate::debug_println!(
+        "[CONVERT] Dropped {} zero-size graph output(s)",
+        before - graph.output.len()
+    );
+}
+
+/// Drop nodes whose outputs nothing consumes, transitively - e.g. the
+/// shape-derived `Shape -> Gather -> Equal -> Cast` condition chain left behind
+/// after a constant `If` is inlined. Dead ops are not just waste: backends may
+/// reject them (CoreML fails to compile a scalar `equal` the graph never uses).
+/// ONNX nodes are pure, so removal is side-effect free.
+fn prune_dead_nodes(graph: &mut crate::protos::onnx::GraphProto) {
+    /// Names a subgraph reads from enclosing scopes: anything referenced by its
+    /// nodes/outputs that the subgraph does not define itself. Locals of
+    /// intermediate scopes are over-approximated as captures, which only
+    /// over-keeps - safe for pruning.
+    fn collect_subgraph_captures(
+        g: &crate::protos::onnx::GraphProto,
+        needed: &mut HashSet<String>,
+    ) {
+        let mut local: HashSet<&str> = g.input.iter().map(|vi| vi.name.as_str()).collect();
+        local.extend(g.initializer.iter().map(|t| t.name.as_str()));
+        for n in &g.node {
+            local.extend(n.output.iter().map(|s| s.as_str()));
+        }
+        for n in &g.node {
+            for i in &n.input {
+                if !i.is_empty() && !local.contains(i.as_str()) {
+                    needed.insert(i.clone());
+                }
+            }
+            for a in &n.attribute {
+                if let Some(sg) = a.g.as_ref() {
+                    collect_subgraph_captures(sg, needed);
+                }
+                for sg in &a.graphs {
+                    collect_subgraph_captures(sg, needed);
+                }
+            }
+        }
+        for o in &g.output {
+            if !local.contains(o.name.as_str()) {
+                needed.insert(o.name.clone());
+            }
+        }
+    }
+
+    let mut needed: HashSet<String> = graph.output.iter().map(|o| o.name.clone()).collect();
+    let mut kept = vec![false; graph.node.len()];
+    // Nodes are topologically sorted per the ONNX spec, so one reverse pass
+    // reaches every transitive producer.
+    for (idx, node) in graph.node.iter().enumerate().rev() {
+        if node.output.iter().any(|o| needed.contains(o)) {
+            kept[idx] = true;
+            needed.extend(node.input.iter().filter(|i| !i.is_empty()).cloned());
+            // Control-flow bodies (If/Loop/Scan) read outer values that never
+            // appear in node.input; keep their producers and initializers.
+            for a in &node.attribute {
+                if let Some(sg) = a.g.as_ref() {
+                    collect_subgraph_captures(sg, &mut needed);
+                }
+                for sg in &a.graphs {
+                    collect_subgraph_captures(sg, &mut needed);
+                }
+            }
+        }
+    }
+    if kept.iter().all(|&k| k) {
+        return;
+    }
+    let dropped = kept.iter().filter(|&&k| !k).count();
+    let mut it = kept.iter();
+    graph.node.retain(|_| *it.next().unwrap());
+    // Drop initializers only dead nodes referenced; keep any that double as
+    // graph inputs (older opsets) so declared feeds stay well-formed.
+    let input_names: HashSet<&str> = graph.input.iter().map(|vi| vi.name.as_str()).collect();
+    graph
+        .initializer
+        .retain(|t| needed.contains(&t.name) || input_names.contains(t.name.as_str()));
+    crate::debug_println!("[if-inline] pruned {dropped} dead node(s)");
+}
+
+/// Drop graph inputs no node consumes (e.g. the KV cache of an inlined
+/// no-cache branch). Inputs wired straight to a graph output are kept.
+fn prune_unused_graph_inputs(model: &mut ModelProto) {
+    let Some(graph) = model.graph.as_mut() else {
+        return;
+    };
+    let used: HashSet<String> = graph
+        .node
+        .iter()
+        .flat_map(|n| n.input.iter().cloned())
+        .chain(graph.output.iter().map(|o| o.name.clone()))
+        .collect();
+    graph.input.retain(|vi| used.contains(&vi.name));
 }
 
 struct TensorInfo {
@@ -261,7 +509,7 @@ impl OnnxConverter {
         // **Custom / vendor domains later:** to support non-official ops (e.g.
         // `com.microsoft.FusedConv`), extend handlers to register on `(domain, op_type)` and
         // update this loop to use the same key. Until then, a custom-domain node whose `op_type`
-        // collides with an `ai.onnx` name may pass the pre-scan and be lowered incorrectly —
+        // collides with an `ai.onnx` name may pass the pre-scan and be lowered incorrectly -
         // domain-aware dispatch is required before enabling those graphs.
         {
             let registry = crate::onnx::ops::OpRegistry::new();
@@ -387,6 +635,10 @@ impl OnnxConverter {
                                     DimensionValue::DimValue(v) => {
                                         if *v > 0 {
                                             resolved.push(Dimension::Static(*v as u32));
+                                        } else if let Some(v) =
+                                            effective_overrides.get(&format!("{}_dim{}", name, idx))
+                                        {
+                                            resolved.push(Dimension::Static(*v));
                                         } else if options.experimental_dynamic_inputs {
                                             resolved.push(Dimension::Dynamic(DynamicDimension {
                                                 name: format!("{}_dim{}", name, idx),
@@ -503,7 +755,7 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 .collect();
 
             let bytes = tensor_proto_to_bytes(initializer)?;
-            b.register_constant_from_bytes(initializer.name.as_str(), data_type, &shape, &bytes)?;
+            b.register_constant_from_bytes(initializer.name.as_str(), data_type, &shape, bytes)?;
 
             value_name_map.insert(initializer.name.as_str().to_string(), name.clone());
             value_name_map.insert(name.clone(), name.clone());
@@ -725,7 +977,15 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                 }
                             }
                         }
-                        if !dims.is_empty() {
+                        // Without the dynamic-inputs feature, rustnn rejects graphs
+                        // containing Dynamic dimensions - keep only fully static
+                        // metadata so unresolved composite dim_params (e.g.
+                        // "batch_size * sequence_length") never reach the builder.
+                        let keep_dims = options.experimental_dynamic_inputs
+                            || dims
+                                .iter()
+                                .all(|d| matches!(d, rustnn::graph::Dimension::Static(_)));
+                        if !dims.is_empty() && keep_dims {
                             value_shape_dims.insert(value_info.name.as_str().to_string(), dims);
                         }
                     }
@@ -927,6 +1187,28 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
         if let Some(val) = const_values.get("/model/rotary_emb/Where_output_0") {
             crate::debug_println!("[NODE CONV] /model/rotary_emb/Where_output_0 = {:?}", val);
         }
+        // O2W_PROBE=<substr>: dump post-propagation shape/const state for
+        // matching node outputs (diagnostics only).
+        if let Ok(probe) = std::env::var("O2W_PROBE") {
+            for onnx_node in onnx_graph.node.as_slice() {
+                for out in onnx_node.output.as_slice() {
+                    if out.contains(&probe) {
+                        eprintln!(
+                            "[probe] {} ({}) shape={:?} type={:?} const={:?}",
+                            out,
+                            onnx_node.op_type,
+                            value_shapes.get(out.as_str()),
+                            value_types.get(out.as_str()),
+                            const_values.get(out.as_str()).map(|v| v
+                                .iter()
+                                .take(8)
+                                .copied()
+                                .collect::<Vec<_>>()),
+                        );
+                    }
+                }
+            }
+        }
         for onnx_node in onnx_graph.node.as_slice() {
             // If all outputs are compile-time constants, emit them directly and skip conversion
             let outputs = onnx_node.output.as_slice();
@@ -974,7 +1256,7 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                 &const_name,
                                 DataType::Int64,
                                 &shape,
-                                &bytes,
+                                bytes,
                             )?;
 
                             value_name_map.insert(out.to_string(), const_name.clone());
@@ -988,6 +1270,13 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 // nodes have a defined producer.
                 for out in outputs {
                     if let Some(values) = const_values.get(out) {
+                        // Zero-element constants (e.g. folded empty axes lists)
+                        // cannot exist as WebNN operands; consumers treat them
+                        // as absent optionals.
+                        if values.is_empty() {
+                            b.mark_empty_optional(out);
+                            continue;
+                        }
                         let const_name = sanitize_identifier(out);
                         let mut shape = value_shapes
                             .get(out.as_str())
@@ -1001,20 +1290,52 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                             // carries the post-broadcast shape but const_values stores the compact payload.
                             // Keep shape/data internally consistent by using the compact shape.
                             shape = vec![values.len() as i64];
+                            // Repair value_shapes so downstream shape lookups (e.g. Einsum)
+                            // match the materialized operand instead of the inflated shape.
+                            value_shapes.insert(out.to_string(), shape.clone());
+                            value_shapes.insert(sanitize_identifier(out), shape.clone());
                         }
                         let dtype = value_types
                             .get(out.as_str())
                             .cloned()
                             .unwrap_or(DataType::Int64);
 
-                        // Flatten i64 values into little-endian bytes
-                        let mut bytes = Vec::with_capacity(values.len() * 8);
-                        for v in values {
-                            bytes.extend_from_slice(&v.to_le_bytes());
-                        }
+                        // Serialize the i64 payload at the width of the tracked
+                        // dtype (folded bool masks are Uint8, Cast chains may
+                        // be Int32); unsupported widths fall back to Int64.
+                        let (dtype, bytes): (DataType, Vec<u8>) = match dtype {
+                            DataType::Uint8 | DataType::Int8 => {
+                                (dtype, values.iter().map(|&v| v as u8).collect())
+                            }
+                            DataType::Int32 => (
+                                dtype,
+                                values
+                                    .iter()
+                                    .flat_map(|&v| (v as i32).to_le_bytes())
+                                    .collect(),
+                            ),
+                            DataType::Float32 => (
+                                dtype,
+                                values
+                                    .iter()
+                                    .flat_map(|&v| (v as f32).to_le_bytes())
+                                    .collect(),
+                            ),
+                            DataType::Float16 => (
+                                dtype,
+                                values
+                                    .iter()
+                                    .flat_map(|&v| half::f16::from_f64(v as f64).to_le_bytes())
+                                    .collect(),
+                            ),
+                            _ => (
+                                DataType::Int64,
+                                values.iter().flat_map(|&v| v.to_le_bytes()).collect(),
+                            ),
+                        };
 
                         let shape_u32: Vec<u32> = shape.iter().map(|d| *d as u32).collect();
-                        b.register_constant_from_bytes(&const_name, dtype, &shape_u32, &bytes)?;
+                        b.register_constant_from_bytes(&const_name, dtype, &shape_u32, bytes)?;
 
                         value_name_map.insert(out.to_string(), const_name.clone());
                         value_name_map.insert(const_name.clone(), const_name.clone());
@@ -1063,6 +1384,238 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
 }
 
 /// Convert an ONNX file and validate via rustnn ORT `MLGraphBuilder::build()`.
+/// Resolve `data_location = EXTERNAL` initializers by reading the referenced
+/// files (relative to the model) into `raw_data`. Hub exports split large
+/// weights across several chunk files (`model.onnx_data`, `model.onnx_data_1`,
+/// ...); each tensor names its own `location`, so per-tensor reads handle the
+/// chunking naturally. Files are read once and cached across tensors.
+/// Zero-fill every external tensor (graph and subgraphs) that still lacks
+/// data: the in-memory path of weight-stripped skeleton models.
+fn zero_fill_external_tensors(
+    graph: &mut crate::protos::onnx::GraphProto,
+) -> Result<(), OnnxError> {
+    const EXTERNAL: i32 = 1; // TensorProto_DataLocation::External
+    for tensor in graph.initializer.iter_mut() {
+        if tensor.data_location != EXTERNAL {
+            continue;
+        }
+        let length = tensor
+            .external_data
+            .iter()
+            .find(|e| e.key.as_str() == "length")
+            .and_then(|e| e.value.parse::<usize>().ok());
+        let len = tensor_byte_len(tensor).or(length).ok_or_else(|| {
+            OnnxError::InvalidShape(format!(
+                "external tensor '{}' has no length and an unknown element size",
+                tensor.name
+            ))
+        })?;
+        tensor.raw_data = vec![0u8; len];
+        tensor.data_location = 0;
+        tensor.external_data.clear();
+    }
+    for node in graph.node.iter_mut() {
+        for attr in node.attribute.iter_mut() {
+            if let Some(sub) = attr.g.as_mut() {
+                zero_fill_external_tensors(sub)?;
+            }
+            for sub in attr.graphs.iter_mut() {
+                zero_fill_external_tensors(sub)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drop every initializer payload (graph and subgraphs), keeping names, dims
+/// and types. Called once lowering has copied all constants into the WebNN
+/// graph, so the proto's weight volume is released before the backend compile.
+fn strip_initializer_payloads(graph: &mut crate::protos::onnx::GraphProto) {
+    for tensor in graph.initializer.iter_mut() {
+        tensor.raw_data = Vec::new();
+        tensor.float_data = Vec::new();
+        tensor.int32_data = Vec::new();
+        tensor.int64_data = Vec::new();
+        tensor.double_data = Vec::new();
+        tensor.uint64_data = Vec::new();
+        tensor.string_data = Vec::new();
+    }
+    for node in graph.node.iter_mut() {
+        for attr in node.attribute.iter_mut() {
+            if let Some(sub) = attr.g.as_mut() {
+                strip_initializer_payloads(sub);
+            }
+            for sub in attr.graphs.iter_mut() {
+                strip_initializer_payloads(sub);
+            }
+        }
+    }
+}
+
+/// Byte size of a tensor from its dims and element type.
+fn tensor_byte_len(tensor: &crate::protos::onnx::TensorProto) -> Option<usize> {
+    let elem = match tensor.data_type {
+        x if x == TensorProto_DataType::Float as i32
+            || x == TensorProto_DataType::Int32 as i32
+            || x == TensorProto_DataType::Uint32 as i32 =>
+        {
+            4
+        }
+        x if x == TensorProto_DataType::Float16 as i32
+            || x == TensorProto_DataType::Bfloat16 as i32
+            || x == TensorProto_DataType::Int16 as i32
+            || x == TensorProto_DataType::Uint16 as i32 =>
+        {
+            2
+        }
+        x if x == TensorProto_DataType::Int64 as i32
+            || x == TensorProto_DataType::Uint64 as i32
+            || x == TensorProto_DataType::Double as i32 =>
+        {
+            8
+        }
+        x if x == TensorProto_DataType::Int8 as i32
+            || x == TensorProto_DataType::Uint8 as i32
+            || x == TensorProto_DataType::Bool as i32 =>
+        {
+            1
+        }
+        // UINT4 / INT4: two elements per byte, handled below.
+        21 | 22 => 0,
+        _ => return None,
+    };
+    let numel: usize = tensor.dims.iter().try_fold(1usize, |acc, &d| {
+        usize::try_from(d).ok().and_then(|d| acc.checked_mul(d))
+    })?;
+    if elem == 0 {
+        return Some(numel.div_ceil(2));
+    }
+    numel.checked_mul(elem)
+}
+
+fn load_external_tensor_data(
+    model: &mut ModelProto,
+    onnx_path: &Path,
+    zero_fill_missing: bool,
+) -> Result<(), OnnxError> {
+    const EXTERNAL: i32 = 1; // TensorProto_DataLocation::External
+    let graph = match model.graph.as_mut() {
+        Some(g) => g,
+        None => return Ok(()),
+    };
+    if !graph
+        .initializer
+        .iter()
+        .any(|t| t.data_location == EXTERNAL)
+    {
+        return Ok(());
+    }
+    let base_dir = onnx_path.parent().unwrap_or_else(|| Path::new("."));
+    // Keep open handles, not file contents: weight files are multi-GB and every
+    // tensor is copied into `raw_data` anyway.
+    let mut files: std::collections::HashMap<String, fs::File> = std::collections::HashMap::new();
+
+    for tensor in graph.initializer.iter_mut() {
+        if tensor.data_location != EXTERNAL {
+            continue;
+        }
+        let mut location = None;
+        let mut offset = 0usize;
+        let mut length = None;
+        for entry in tensor.external_data.as_slice() {
+            match entry.key.as_str() {
+                "location" => location = Some(entry.value.clone()),
+                "offset" => {
+                    offset = entry.value.trim().parse::<usize>().map_err(|_| {
+                        OnnxError::InvalidShape(format!(
+                            "invalid external data offset '{}' for tensor '{}'",
+                            entry.value, tensor.name
+                        ))
+                    })?;
+                }
+                "length" => {
+                    length = Some(entry.value.trim().parse::<usize>().map_err(|_| {
+                        OnnxError::InvalidShape(format!(
+                            "invalid external data length '{}' for tensor '{}'",
+                            entry.value, tensor.name
+                        ))
+                    })?);
+                }
+                _ => {}
+            }
+        }
+        let location = location.ok_or_else(|| {
+            OnnxError::InvalidShape(format!(
+                "external tensor '{}' has no data location",
+                tensor.name
+            ))
+        })?;
+        // The spec requires relative paths inside the model directory.
+        if Path::new(&location).is_absolute() || location.contains("..") {
+            return Err(OnnxError::InvalidShape(format!(
+                "external tensor '{}' references a non-relative location '{location}'",
+                tensor.name
+            )));
+        }
+        let path = base_dir.join(&location);
+        if zero_fill_missing && !path.exists() {
+            // dims x element size is authoritative; `length` is a fallback
+            // for element types we cannot size.
+            let len = tensor_byte_len(tensor).or(length).ok_or_else(|| {
+                OnnxError::InvalidShape(format!(
+                    "external tensor '{}' has no length and an unknown element size",
+                    tensor.name
+                ))
+            })?;
+            tensor.raw_data = vec![0u8; len];
+            tensor.data_location = 0;
+            tensor.external_data.clear();
+            continue;
+        }
+        if !files.contains_key(&location) {
+            let file = fs::File::open(&path).map_err(|e| {
+                OnnxError::InvalidShape(format!(
+                    "failed to read external data '{}' for tensor '{}': {e}",
+                    path.display(),
+                    tensor.name
+                ))
+            })?;
+            files.insert(location.clone(), file);
+        }
+        let file = files.get_mut(&location).expect("inserted above");
+        let file_len = file
+            .metadata()
+            .map_err(|e| OnnxError::InvalidShape(format!("external data '{location}': {e}")))?
+            .len() as usize;
+        let end = match length {
+            Some(len) => offset.checked_add(len),
+            None => Some(file_len),
+        }
+        .filter(|&end| end <= file_len)
+        .ok_or_else(|| {
+            OnnxError::InvalidShape(format!(
+                "external tensor '{}' range {offset}+{:?} exceeds '{location}' ({file_len} bytes)",
+                tensor.name, length
+            ))
+        })?;
+        use std::io::{Read, Seek, SeekFrom};
+        let mut bytes = vec![0u8; end - offset];
+        file.seek(SeekFrom::Start(offset as u64))
+            .and_then(|_| file.read_exact(&mut bytes))
+            .map_err(|e| {
+                OnnxError::InvalidShape(format!(
+                    "failed to read external data '{}' for tensor '{}': {e}",
+                    path.display(),
+                    tensor.name
+                ))
+            })?;
+        tensor.raw_data = bytes;
+        tensor.data_location = 0;
+        tensor.external_data.clear();
+    }
+    Ok(())
+}
+
 pub fn convert_onnx<P: AsRef<Path>>(
     onnx_path: P,
     mut options: ConvertOptions,
@@ -1074,15 +1627,14 @@ pub fn convert_onnx<P: AsRef<Path>>(
     // Parse protobuf
     let mut model: ModelProto =
         ModelProto::decode(&onnx_bytes[..]).map_err(|e| OnnxError::ProtobufError(e.to_string()))?;
+    // Inline weights now live in `model`; release the file buffer.
+    drop(onnx_bytes);
 
-    // Apply constant folding if optimize flag is set
-    if options.optimize {
-        crate::debug_println!("Running constant folding...");
-        let evaluators = crate::onnx::constant_folding::evaluators::get_evaluators();
-        let nodes_folded =
-            crate::onnx::constant_folding::fold_constants_in_model(&mut model, &evaluators)?;
-        crate::debug_println!("Constant folding: {} nodes folded", nodes_folded);
-    }
+    load_external_tensor_data(
+        &mut model,
+        onnx_path_ref,
+        options.zero_fill_missing_external_data,
+    )?;
 
     // Merge overrides from sidecar dims file if provided implicitly and not already set
     if options.free_dim_overrides.is_empty() {
@@ -1112,6 +1664,215 @@ pub fn convert_onnx<P: AsRef<Path>>(
     convert_model(model, &options)
 }
 
+/// Inline `If` nodes whose condition folds to a constant (e.g. pyannote's
+/// shape-derived `Equal(Gather(Shape(x)), k)` gate). The chosen branch's
+/// nodes and initializers are spliced into the outer graph with internal
+/// names prefixed; outer-scope captures keep their names. Runtime-dependent
+/// conditions are left in place (and later rejected as unsupported).
+fn inline_constant_ifs(model: &mut ModelProto, options: &ConvertOptions) {
+    use crate::protos::onnx::GraphProto;
+
+    for _ in 0..4 {
+        let graph = match model.graph.as_ref() {
+            Some(g) if g.node.iter().any(|n| n.op_type == "If") => g,
+            _ => return,
+        };
+
+        // Minimal seeding so shape-derived conditions fold.
+        let mut value_shapes: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut value_types: HashMap<String, DataType> = HashMap::new();
+        let mut const_values: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut value_shape_dims = HashMap::new();
+        for vi in graph.input.as_slice() {
+            let Some(TypeProtoValue::TensorType(tt)) =
+                vi.r#type.as_ref().and_then(|t| t.value.as_ref())
+            else {
+                continue;
+            };
+            let Some(shape) = tt.shape.as_ref() else {
+                continue;
+            };
+            let dims: Option<Vec<i64>> = shape
+                .dim
+                .iter()
+                .enumerate()
+                .map(|(idx, d)| match d.value.as_ref() {
+                    Some(DimensionValue::DimValue(v)) if *v > 0 => Some(*v),
+                    Some(DimensionValue::DimValue(_)) => options
+                        .free_dim_overrides
+                        .get(&format!("{}_dim{}", sanitize_identifier(&vi.name), idx))
+                        .map(|&v| v as i64),
+                    Some(DimensionValue::DimParam(p)) => {
+                        options.free_dim_overrides.get(p).map(|&v| v as i64)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if let Some(dims) = dims {
+                value_shapes.insert(vi.name.clone(), dims);
+            }
+        }
+        let initializers_map: HashMap<String, &crate::protos::onnx::TensorProto> = graph
+            .initializer
+            .iter()
+            .map(|t| (t.name.clone(), t))
+            .collect();
+        for (name, t) in &initializers_map {
+            value_shapes.insert(name.clone(), t.dims.clone());
+            let vals = crate::onnx::shape_inference::read_int_tensor(t);
+            if !vals.is_empty() {
+                const_values.insert(name.clone(), vals);
+            }
+        }
+        for node in graph.node.as_slice() {
+            if node.op_type == "Constant" {
+                if let (Some(out), Some(t)) = (
+                    node.output.first(),
+                    node.attribute
+                        .iter()
+                        .find(|a| a.name == "value")
+                        .and_then(|a| a.t.as_ref()),
+                ) {
+                    let vals = crate::onnx::shape_inference::read_int_tensor(t);
+                    if !vals.is_empty() {
+                        value_shapes.insert(out.clone(), t.dims.clone());
+                        const_values.insert(out.clone(), vals);
+                    }
+                }
+            }
+        }
+        crate::onnx::shape_inference::propagate_shapes_and_fold_constants(
+            graph,
+            &initializers_map,
+            &mut value_shapes,
+            &mut value_types,
+            &mut const_values,
+            &mut value_shape_dims,
+            &crate::onnx::shape_inference::PropagateOptions {
+                optimize: true,
+                experimental_dynamic_inputs: false,
+            },
+        );
+
+        // Splice each If with a folded condition.
+        let mut new_nodes: Vec<crate::protos::onnx::NodeProto> = Vec::new();
+        let mut new_initializers: Vec<crate::protos::onnx::TensorProto> = Vec::new();
+        let mut changed = false;
+        for node in graph.node.as_slice() {
+            if node.op_type != "If" {
+                new_nodes.push(node.clone());
+                continue;
+            }
+            let cond = node
+                .input
+                .first()
+                .and_then(|c| const_values.get(c.as_str()))
+                .and_then(|v| v.first().copied());
+            let Some(cond) = cond else {
+                new_nodes.push(node.clone());
+                continue;
+            };
+            let branch_attr = if cond != 0 {
+                "then_branch"
+            } else {
+                "else_branch"
+            };
+            let Some(branch): Option<&GraphProto> = node
+                .attribute
+                .iter()
+                .find(|a| a.name == branch_attr)
+                .and_then(|a| a.g.as_ref())
+            else {
+                new_nodes.push(node.clone());
+                continue;
+            };
+
+            crate::debug_println!(
+                "[if-inline] {} taking {branch_attr} (cond={cond})",
+                node.name
+            );
+            let prefix = if node.name.is_empty() {
+                format!("{}_if", node.output.first().cloned().unwrap_or_default())
+            } else {
+                node.name.clone()
+            };
+            // Names produced inside the branch get prefixed; everything else
+            // is an outer-scope capture and keeps its name.
+            let mut rename: HashMap<String, String> = HashMap::new();
+            for t in branch.initializer.as_slice() {
+                rename.insert(t.name.clone(), format!("{prefix}::{}", t.name));
+            }
+            for n in branch.node.as_slice() {
+                for out in n.output.as_slice() {
+                    if !out.is_empty() {
+                        rename.insert(out.clone(), format!("{prefix}::{out}"));
+                    }
+                }
+            }
+            // Branch graph outputs feed the If node's outputs directly.
+            for (branch_out, if_out) in branch.output.iter().zip(node.output.as_slice()) {
+                rename.insert(branch_out.name.clone(), if_out.clone());
+            }
+
+            for t in branch.initializer.as_slice() {
+                let mut t = t.clone();
+                if let Some(new_name) = rename.get(&t.name) {
+                    t.name = new_name.clone();
+                }
+                new_initializers.push(t);
+            }
+            let mut produced_outputs: HashSet<String> = HashSet::new();
+            for n in branch.node.as_slice() {
+                let mut n = n.clone();
+                if !n.name.is_empty() {
+                    n.name = format!("{prefix}::{}", n.name);
+                }
+                for i in n.input.iter_mut() {
+                    if let Some(new_name) = rename.get(i) {
+                        *i = new_name.clone();
+                    }
+                }
+                for o in n.output.iter_mut() {
+                    if let Some(new_name) = rename.get(o) {
+                        *o = new_name.clone();
+                    }
+                    produced_outputs.insert(o.clone());
+                }
+                new_nodes.push(n);
+            }
+            // A branch output that is an outer capture or initializer needs an
+            // explicit passthrough to the If output name.
+            for (branch_out, if_out) in branch.output.iter().zip(node.output.as_slice()) {
+                if !produced_outputs.contains(if_out.as_str()) {
+                    let src = rename
+                        .get(&branch_out.name)
+                        .filter(|n| *n != if_out)
+                        .cloned()
+                        .unwrap_or_else(|| branch_out.name.clone());
+                    new_nodes.push(crate::protos::onnx::NodeProto {
+                        op_type: "Identity".to_string(),
+                        name: format!("{prefix}::passthrough_{if_out}"),
+                        input: vec![src],
+                        output: vec![if_out.clone()],
+                        ..Default::default()
+                    });
+                }
+            }
+            changed = true;
+        }
+
+        if !changed {
+            return;
+        }
+        if let Some(g) = model.graph.as_mut() {
+            g.node = new_nodes;
+            g.initializer.extend(new_initializers);
+            // Drop the now-dead condition chain the splice orphaned.
+            prune_dead_nodes(g);
+        }
+    }
+}
+
 /// Lower an in-memory ONNX [`ModelProto`] to [`MLGraphBuilder`] and validate with ORT `build()`.
 pub fn convert_model_proto(
     model: ModelProto,
@@ -1122,10 +1883,29 @@ pub fn convert_model_proto(
 
 /// Lower ONNX to [`MLGraphBuilder`] and validate with ORT `build()`.
 pub(crate) fn convert_model(
-    model: ModelProto,
+    mut model: ModelProto,
     options: &ConvertOptions,
 ) -> Result<ValidatedGraph<'static>, OnnxError> {
-    let converter = OnnxConverter::new(model.clone())?;
+    if options.zero_fill_missing_external_data {
+        if let Some(graph) = model.graph.as_mut() {
+            zero_fill_external_tensors(graph)?;
+        }
+    }
+    pin_graph_inputs(&mut model, &options.pinned_inputs)?;
+    if options.optimize {
+        crate::debug_println!("Running constant folding...");
+        let evaluators = crate::onnx::constant_folding::evaluators::get_evaluators();
+        let nodes_folded =
+            crate::onnx::constant_folding::fold_constants_in_model(&mut model, &evaluators)?;
+        crate::debug_println!("Constant folding: {} nodes folded", nodes_folded);
+    }
+    inline_constant_ifs(&mut model, options);
+    if !options.pinned_inputs.is_empty() {
+        prune_empty_graph_outputs(&mut model);
+        prune_unused_graph_inputs(&mut model);
+    }
+    // Move, don't clone: `model` carries every weight tensor.
+    let mut converter = OnnxConverter::new(model)?;
     converter.extract_metadata()?;
 
     let mut context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, false))
@@ -1136,13 +1916,33 @@ pub(crate) fn convert_model(
 
     converter.convert_with_builder(&mut onnx_builder, options)?;
 
-    let onnx_graph = model
+    // Every constant now lives in the WebNN graph; the proto's copy of the
+    // weights would otherwise stay resident through the whole backend compile
+    // in `finish_build` (for real models that is the full weight volume). Only
+    // the graph's output names are read from the proto below.
+    if let Some(graph) = converter.model.graph.as_mut() {
+        strip_initializer_payloads(graph);
+    }
+
+    let onnx_graph = converter
+        .model
         .graph
         .as_ref()
         .ok_or_else(|| OnnxError::ProtobufError("Missing graph in model".to_string()))?;
 
     let mut outputs: HashMap<String, MLOperand> = HashMap::new();
     for output in onnx_graph.output.as_slice() {
+        // Sequences only exist as lowered elements; one escaping to a graph
+        // output has no WebNN representation.
+        if onnx_builder
+            .sequence_element_count(output.name.as_str())
+            .is_some()
+        {
+            return Err(OnnxError::unsupported_op(
+                "SplitToSequence(sequence graph output)",
+                output.name.clone(),
+            ));
+        }
         let op = onnx_builder.output_operand(output.name.as_str())?;
         let output_key = onnx_builder.build_output_key(output.name.as_str());
         outputs.insert(output_key, op);
@@ -1153,6 +1953,311 @@ pub(crate) fn convert_model(
     let graph = onnx_builder.finish_build(output_refs)?;
 
     Ok(ValidatedGraph { context, graph })
+}
+
+#[cfg(test)]
+mod external_data_tests {
+    use super::*;
+    use crate::onnx::test_models::prelude::*;
+
+    fn model_with_missing_external_weight() -> ModelProto {
+        let mut weight = f32_init("w", &[2, 3], &[]);
+        weight.data_location = 1; // EXTERNAL
+        weight
+            .external_data
+            .push(crate::protos::onnx::StringStringEntryProto {
+                key: "location".to_string(),
+                value: "does_not_exist.bin".to_string(),
+            });
+        model(
+            17,
+            graph(
+                "ext",
+                vec![f32_input("x", &[2, 3])],
+                vec![f32_output("y", &[2, 3])],
+                vec![node("Add", "add", &["x", "w"], &["y"], &[])],
+                vec![weight],
+            ),
+        )
+    }
+
+    #[test]
+    fn tensor_byte_len_uses_dims_and_element_size() {
+        assert_eq!(tensor_byte_len(&f32_init("a", &[2, 3], &[])), Some(24));
+        assert_eq!(tensor_byte_len(&i64_init("b", &[4], &[])), Some(32));
+        assert_eq!(tensor_byte_len(&u8_init("c", &[], &[])), Some(1));
+        assert_eq!(tensor_byte_len(&f16_init("d", &[5], &[])), Some(10));
+    }
+
+    #[test]
+    fn missing_external_data_is_zero_filled_only_when_allowed() {
+        let dir = std::env::temp_dir();
+        let onnx_path = dir.join("skeleton_model.onnx");
+
+        let mut model = model_with_missing_external_weight();
+        let err = load_external_tensor_data(&mut model, &onnx_path, false).unwrap_err();
+        assert!(err.to_string().contains("does_not_exist.bin"), "{err}");
+
+        let mut model = model_with_missing_external_weight();
+        load_external_tensor_data(&mut model, &onnx_path, true).unwrap();
+        let w = &model.graph.as_ref().unwrap().initializer[0];
+        assert_eq!(w.data_location, 0);
+        assert!(w.external_data.is_empty());
+        assert_eq!(w.raw_data, vec![0u8; 24]);
+
+        // The zero-filled skeleton still converts and builds in ORT.
+        let options = ConvertOptions {
+            zero_fill_missing_external_data: true,
+            ..ConvertOptions::default()
+        };
+        convert_model(model, &options).expect("skeleton conversion should succeed");
+    }
+}
+
+#[cfg(test)]
+mod pin_input_tests {
+    use super::*;
+    use crate::onnx::test_models::prelude::*;
+
+    fn if_model_with_bool_input() -> ModelProto {
+        model(
+            17,
+            graph(
+                "pin_graph",
+                vec![f32_input("x", &[2]), bool_input("flag", &[1])],
+                vec![f32_output("y", &[2])],
+                vec![node("Add", "add", &["x", "x"], &["y"], &[])],
+                vec![],
+            ),
+        )
+    }
+
+    #[test]
+    fn parse_pinned_input_accepts_bools_and_integers() {
+        assert_eq!(
+            parse_pinned_input("use_cache_branch=false").unwrap(),
+            ("use_cache_branch".to_string(), 0)
+        );
+        assert_eq!(
+            parse_pinned_input(" flag = true ").unwrap(),
+            ("flag".to_string(), 1)
+        );
+        assert_eq!(parse_pinned_input("n=3").unwrap(), ("n".to_string(), 3));
+        assert!(parse_pinned_input("flag").is_err());
+        assert!(parse_pinned_input("flag=maybe").is_err());
+    }
+
+    #[test]
+    fn pin_graph_inputs_turns_input_into_initializer() {
+        let mut m = if_model_with_bool_input();
+        let pinned = HashMap::from([("flag".to_string(), 1i64)]);
+        pin_graph_inputs(&mut m, &pinned).unwrap();
+        let initializers_after_pin = {
+            let g = m.graph.as_ref().unwrap();
+            assert!(g.input.iter().all(|vi| vi.name != "flag"));
+            let init = g.initializer.iter().find(|t| t.name == "flag").unwrap();
+            assert_eq!(init.data_type, TensorProto_DataType::Bool as i32);
+            assert_eq!(init.dims, vec![1]);
+            assert_eq!(init.raw_data, vec![1u8]);
+            g.initializer.len()
+        };
+
+        // The input is gone now, so pinning it again is an error.
+        assert!(pin_graph_inputs(&mut m, &pinned).is_err());
+        assert_eq!(
+            m.graph.as_ref().unwrap().initializer.len(),
+            initializers_after_pin
+        );
+
+        let unknown = HashMap::from([("nope".to_string(), 1i64)]);
+        assert!(pin_graph_inputs(&mut m, &unknown).is_err());
+    }
+
+    #[test]
+    fn pin_graph_inputs_rejects_dynamic_dims() {
+        let mut m = model(
+            17,
+            graph(
+                "pin_dyn",
+                vec![tensor_input(
+                    "ids",
+                    TensorProto_DataType::Int64 as i32,
+                    &[-1],
+                )],
+                vec![f32_output("y", &[2])],
+                vec![],
+                vec![],
+            ),
+        );
+        // Mark the dim symbolic.
+        if let Some(TypeProtoValue::TensorType(tt)) = m.graph.as_mut().unwrap().input[0]
+            .r#type
+            .as_mut()
+            .and_then(|t| t.value.as_mut())
+        {
+            tt.shape.as_mut().unwrap().dim[0].value =
+                Some(DimensionValue::DimParam("n".to_string()));
+        }
+        let pinned = HashMap::from([("ids".to_string(), 7i64)]);
+        assert!(pin_graph_inputs(&mut m, &pinned).is_err());
+    }
+
+    #[test]
+    fn prune_dead_nodes_drops_dead_chain_and_keeps_input_initializers() {
+        use crate::onnx::test_models::prelude::*;
+        let mut m = model(
+            17,
+            graph(
+                "prune_dead",
+                vec![f32_input("x", &[2, 3]), i64_input("kept_in", &[1])],
+                vec![f32_output("y", &[2, 3])],
+                vec![
+                    node("Add", "live", &["x", "x"], &["y"], &[]),
+                    // Dead chain: nothing consumes `cond`.
+                    node("Shape", "shape", &["x"], &["xs"], &[]),
+                    node(
+                        "Gather",
+                        "gather",
+                        &["xs", "idx"],
+                        &["d0"],
+                        &[attr_int("axis", 0)],
+                    ),
+                    node("Equal", "eq", &["d0", "two"], &["cond"], &[]),
+                ],
+                vec![
+                    i64_init("idx", &[], &[0]),
+                    i64_init("two", &[], &[2]),
+                    // Doubles as a graph input; must survive even though only
+                    // dead nodes referenced it.
+                    i64_init("kept_in", &[1], &[5]),
+                ],
+            ),
+        );
+        prune_dead_nodes(m.graph.as_mut().unwrap());
+        let g = m.graph.as_ref().unwrap();
+        let names: Vec<&str> = g.node.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["live"]);
+        assert!(g
+            .initializer
+            .iter()
+            .all(|t| t.name != "idx" && t.name != "two"));
+        assert!(g.initializer.iter().any(|t| t.name == "kept_in"));
+    }
+
+    #[test]
+    fn prune_dead_nodes_keeps_producers_captured_by_if_subgraphs() {
+        use crate::onnx::test_models::prelude::*;
+        use crate::protos::onnx::AttributeProto;
+
+        // `captured` is produced at top level but consumed ONLY implicitly
+        // inside the If's branch bodies - it must survive pruning.
+        let branch = |tag: &str| {
+            graph(
+                &format!("{tag}_g"),
+                vec![],
+                vec![f32_output("branch_out", &[2, 3])],
+                vec![node(
+                    "Identity",
+                    &format!("{tag}_id"),
+                    &["captured"],
+                    &["branch_out"],
+                    &[],
+                )],
+                vec![],
+            )
+        };
+        let mut if_node = node("If", "test_if", &["cond"], &["y"], &[]);
+        for (name, g) in [
+            ("then_branch", branch("then")),
+            ("else_branch", branch("else")),
+        ] {
+            if_node.attribute.push(AttributeProto {
+                name: name.to_string(),
+                r#type: 5, // GRAPH
+                g: Some(g),
+                ..Default::default()
+            });
+        }
+        let mut m = model(
+            17,
+            graph(
+                "prune_captures",
+                vec![f32_input("x", &[2, 3]), bool_input("cond", &[])],
+                vec![f32_output("y", &[2, 3])],
+                vec![
+                    node("Add", "capture_producer", &["x", "x"], &["captured"], &[]),
+                    if_node,
+                ],
+                vec![],
+            ),
+        );
+        prune_dead_nodes(m.graph.as_mut().unwrap());
+        let g = m.graph.as_ref().unwrap();
+        let names: Vec<&str> = g.node.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&"capture_producer"),
+            "producer consumed only inside If branches was pruned: {names:?}"
+        );
+        assert!(names.contains(&"test_if"));
+    }
+
+    #[test]
+    fn prune_empty_graph_outputs_drops_zero_size_constants() {
+        let mut m = model(
+            17,
+            graph(
+                "prune_out",
+                vec![f32_input("x", &[2])],
+                vec![f32_output("y", &[2]), f32_output("dummy", &[0, 4])],
+                vec![
+                    node("Add", "add", &["x", "x"], &["y"], &[]),
+                    node(
+                        "Constant",
+                        "dummy_const",
+                        &[],
+                        &["dummy"],
+                        &[attr_tensor("value", f32_init("dummy_val", &[0, 4], &[]))],
+                    ),
+                ],
+                vec![],
+            ),
+        );
+        prune_empty_graph_outputs(&mut m);
+        let g = m.graph.as_ref().unwrap();
+        assert_eq!(
+            g.output.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
+            vec!["y"]
+        );
+        assert!(g.node.iter().all(|n| n.op_type != "Constant"));
+    }
+
+    #[test]
+    fn prune_unused_graph_inputs_keeps_consumed_and_passthrough_inputs() {
+        let mut m = model(
+            17,
+            graph(
+                "prune_in",
+                vec![
+                    f32_input("x", &[2]),
+                    f32_input("unused", &[2]),
+                    f32_input("passthrough", &[2]),
+                ],
+                vec![f32_output("y", &[2]), f32_output("passthrough", &[2])],
+                vec![node("Add", "add", &["x", "x"], &["y"], &[])],
+                vec![],
+            ),
+        );
+        prune_unused_graph_inputs(&mut m);
+        let names: Vec<&str> = m
+            .graph
+            .as_ref()
+            .unwrap()
+            .input
+            .iter()
+            .map(|vi| vi.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["x", "passthrough"]);
+    }
 }
 
 #[cfg(test)]

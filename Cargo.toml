@@ -13,6 +13,11 @@ path = "src/lib.rs"
 name = "onnx2webnn"
 path = "src/main.rs"
 
+[features]
+# Enable rustnn's CoreML backend (macOS only). With this feature compiled,
+# MLContext::create selects CoreML automatically on macOS.
+coreml = ["rustnn/coreml-runtime"]
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }

@@ -11,6 +11,18 @@ WEBNN_SUPPORTED_ONNX_OPS: frozenset[str] = frozenset(
         "MatMul",
         "Gemm",
         "MatMulNBits",
+        "MatMulInteger",
+        "MatMulBnb4",
+        # attention.rs
+        "GroupQueryAttention",
+        # moe.rs
+        "MoE",
+        # convert.rs inline_constant_ifs: If with a constant condition is
+        # inlined; runtime conditions remain unsupported.
+        "If",
+        "QMoE",
+        # einsum.rs
+        "Einsum",
         # conv.rs
         "Conv",
         "ConvTranspose",
@@ -74,7 +86,9 @@ WEBNN_SUPPORTED_ONNX_OPS: frozenset[str] = frozenset(
         "DynamicQuantizeLinear",
         # utility.rs
         "Shape",
+        "OneHot",
         "Gather",
+        "GatherBlockQuantized",
         "GatherND",
         "GatherElements",
         "ReverseSequence",

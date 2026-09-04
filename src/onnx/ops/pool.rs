@@ -197,12 +197,21 @@ fn pool2d_spatial_out(
     }
 }
 
+/// WebNN pool2d options plus, for `AveragePool(count_include_pad=1)`, the
+/// explicit zero padding to apply beforehand so the pads count in the average.
+#[derive(Debug)]
+struct Pool2dPlan {
+    opts: MLPool2dOptions,
+    /// [top, bottom, left, right] zero padding to apply before pooling.
+    pre_pad: Option<[u32; 4]>,
+}
+
 fn build_pool_2d_options(
     attrs: &PoolAttrs,
     kernel: &[i64],
     kind: PoolKind,
     label: &str,
-) -> Result<MLPool2dOptions, OnnxError> {
+) -> Result<Pool2dPlan, OnnxError> {
     let strides = attrs.strides.clone().unwrap_or_else(|| vec![1, 1]);
     let dilations = attrs.dilations.clone().unwrap_or_else(|| vec![1, 1]);
     let pads = attrs.pads.clone().unwrap_or_else(|| vec![0, 0, 0, 0]);
@@ -211,13 +220,6 @@ fn build_pool_2d_options(
             "pool2d: expected length-2 kernel/strides/dilations, got kernel={:?} strides={:?} dilations={:?}",
             kernel, strides, dilations
         )));
-    }
-
-    if matches!(kind, PoolKind::Average) && attrs.count_include_pad {
-        return Err(OnnxError::unsupported_op(
-            "AveragePool(count_include_pad=1)".to_string(),
-            String::new(),
-        ));
     }
 
     let mut opts = MLPool2dOptions {
@@ -252,7 +254,58 @@ fn build_pool_2d_options(
         opts.padding = i64_vec_to_u32(&effective_pads)?;
     }
 
-    Ok(opts)
+    // WebNN averagePool2d never counts padding; ONNX count_include_pad=1 does.
+    // Pad explicitly with zeros and pool without padding instead.
+    let mut pre_pad = None;
+    if matches!(kind, PoolKind::Average)
+        && attrs.count_include_pad
+        && opts.padding.iter().any(|&p| p != 0)
+    {
+        pre_pad = Some([
+            opts.padding[0],
+            opts.padding[1],
+            opts.padding[2],
+            opts.padding[3],
+        ]);
+        opts.padding = vec![0, 0, 0, 0];
+    } else if matches!(kind, PoolKind::Average)
+        && attrs.count_include_pad
+        && map_auto_pad(&attrs.auto_pad) != "explicit"
+    {
+        return Err(OnnxError::unsupported_op(
+            format!(
+                "AveragePool(count_include_pad=1, auto_pad={})",
+                attrs.auto_pad
+            ),
+            String::new(),
+        ));
+    }
+
+    Ok(Pool2dPlan { opts, pre_pad })
+}
+
+/// Zero-pad the spatial dims of an NCHW operand ([top, bottom, left, right]).
+fn zero_pad_spatial(
+    b: &mut OnnxBuilder<'_, '_, '_>,
+    input: rustnn::mlcontext::MLOperand,
+    pads: [u32; 4],
+    label: &str,
+) -> Result<rustnn::mlcontext::MLOperand, OnnxError> {
+    let out = b
+        .builder
+        .pad_with_options(
+            input,
+            vec![0, 0, pads[0], pads[2]],
+            vec![0, 0, pads[1], pads[3]],
+            rustnn::operator_options::MLPadOptions {
+                label: label.to_string(),
+                mode: "constant".to_string(),
+                value: None,
+            },
+        )
+        .map_err(map_op_error)?;
+    b.record_operand(&[label], out);
+    Ok(out)
 }
 
 impl PoolHandler {
@@ -325,9 +378,12 @@ impl PoolHandler {
 
         match spatial_rank {
             2 => {
-                let input = b.resolve_operand(input_raw)?;
-                let opts = build_pool_2d_options(&attrs, &kernel, kind, &output_name)?;
-                self.emit_pool(b, node, &output_name, input, opts, kind)
+                let mut input = b.resolve_operand(input_raw)?;
+                let plan = build_pool_2d_options(&attrs, &kernel, kind, &output_name)?;
+                if let Some(pads) = plan.pre_pad {
+                    input = zero_pad_spatial(b, input, pads, &format!("{output_name}_padded"))?;
+                }
+                self.emit_pool(b, node, &output_name, input, plan.opts, kind)
             }
             1 => self.emit_pool_1d_via_2d(
                 node,
@@ -388,7 +444,7 @@ impl PoolHandler {
 
         let in_4d = i64_slice_to_mldim(&[input_shape[0], input_shape[1], input_shape[2], 1])?;
         let input = b.resolve_operand(input_raw)?;
-        let x4d = b
+        let mut x4d = b
             .builder
             .reshape_with_options(
                 input,
@@ -398,7 +454,11 @@ impl PoolHandler {
             .map_err(map_op_error)?;
         b.record_operand(&[&reshape_in_label], x4d);
 
-        let pool_opts = build_pool_2d_options(&attrs_2d, &kernel_2d, kind, &pool_label)?;
+        let plan = build_pool_2d_options(&attrs_2d, &kernel_2d, kind, &pool_label)?;
+        if let Some(pads) = plan.pre_pad {
+            x4d = zero_pad_spatial(b, x4d, pads, &format!("{pool_label}_padded"))?;
+        }
+        let pool_opts = plan.opts;
         let pooled = match kind {
             PoolKind::Max => b.builder.max_pool2d_with_options(x4d, pool_opts),
             PoolKind::Average => b.builder.average_pool2d_with_options(x4d, pool_opts),
@@ -468,7 +528,7 @@ impl PoolHandler {
         let input_raw = inputs[0].as_str();
         let input_shape = lookup_shape(input_raw, context).ok_or_else(|| {
             OnnxError::InvalidShape(format!(
-                "{}: input '{}' shape is unknown — required to determine spatial window size",
+                "{}: input '{}' shape is unknown - required to determine spatial window size",
                 op_label, input_raw
             ))
         })?;
@@ -793,35 +853,69 @@ mod tests {
     }
 
     #[test]
-    fn averagepool_count_include_pad_rejected() {
-        let h = PoolHandler;
-        let node = make_node(
+    fn averagepool_count_include_pad_without_padding_is_plain_pool() {
+        let attrs = parse_pool_attrs(&make_node(
             "AveragePool",
             vec!["x"],
             vec!["y"],
             vec![
-                ints_attr("kernel_shape", vec![2, 2]),
+                ints_attr("kernel_shape", vec![16, 16]),
+                ints_attr("strides", vec![16, 16]),
                 int_attr("count_include_pad", 1),
             ],
-        );
-        let initializers = HashMap::new();
-        let mut value_shapes = HashMap::new();
-        value_shapes.insert("x".to_string(), vec![1, 8, 14, 14]);
-        let const_values = HashMap::new();
-        let value_ids = HashMap::new();
-        let value_types = HashMap::new();
-        let ctx = make_context(
-            &initializers,
-            &value_shapes,
-            &const_values,
-            &value_ids,
-            &value_types,
-        );
-        let err = crate::onnx::ops::convert_handler_with_context(&h, &node, &ctx).unwrap_err();
+        ));
+        let plan = build_pool_2d_options(&attrs, &[16, 16], PoolKind::Average, "y").unwrap();
+        assert!(plan.pre_pad.is_none());
+        assert_eq!(plan.opts.window_dimensions, Some(vec![16, 16]));
+    }
+
+    #[test]
+    fn averagepool_count_include_pad_moves_padding_to_explicit_pad() {
+        let attrs = parse_pool_attrs(&make_node(
+            "AveragePool",
+            vec!["x"],
+            vec!["y"],
+            vec![
+                ints_attr("kernel_shape", vec![3, 3]),
+                ints_attr("pads", vec![1, 2, 3, 4]),
+                int_attr("count_include_pad", 1),
+            ],
+        ));
+        let plan = build_pool_2d_options(&attrs, &[3, 3], PoolKind::Average, "y").unwrap();
+        // ONNX [top, left, bottom, right] -> WebNN [top, bottom, left, right]
+        assert_eq!(plan.pre_pad, Some([1, 3, 2, 4]));
+        assert_eq!(plan.opts.padding, vec![0, 0, 0, 0]);
+
+        // Without count_include_pad the padding stays on the pool op.
+        let attrs = parse_pool_attrs(&make_node(
+            "AveragePool",
+            vec!["x"],
+            vec!["y"],
+            vec![
+                ints_attr("kernel_shape", vec![3, 3]),
+                ints_attr("pads", vec![1, 2, 3, 4]),
+            ],
+        ));
+        let plan = build_pool_2d_options(&attrs, &[3, 3], PoolKind::Average, "y").unwrap();
+        assert!(plan.pre_pad.is_none());
+        assert_eq!(plan.opts.padding, vec![1, 3, 2, 4]);
+    }
+
+    #[test]
+    fn averagepool_count_include_pad_with_auto_pad_rejected() {
+        let attrs = parse_pool_attrs(&make_node(
+            "AveragePool",
+            vec!["x"],
+            vec!["y"],
+            vec![
+                ints_attr("kernel_shape", vec![3, 3]),
+                int_attr("count_include_pad", 1),
+                string_attr("auto_pad", "SAME_UPPER"),
+            ],
+        ));
+        let err = build_pool_2d_options(&attrs, &[3, 3], PoolKind::Average, "y").unwrap_err();
         match err {
-            OnnxError::UnsupportedOps(ops) => {
-                assert!(ops[0].op.contains("count_include_pad"));
-            }
+            OnnxError::UnsupportedOps(ops) => assert!(ops[0].op.contains("count_include_pad")),
             other => panic!("expected UnsupportedOp, got {:?}", other),
         }
     }

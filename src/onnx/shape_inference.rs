@@ -181,8 +181,21 @@ fn seed_inputs(
         for dim in shape.dim.as_slice() {
             if let Some(value) = &dim.value {
                 match value {
-                    DimensionValue::DimValue(v) => {
+                    DimensionValue::DimValue(v) if *v > 0 => {
                         shape_dims.push(*v);
+                    }
+                    DimensionValue::DimValue(_) => {
+                        // Unnamed dynamic dim: overridable as `<input>_dim<axis>`.
+                        let hint =
+                            format!("{}_dim{}", sanitize_identifier(&name), shape_dims.len());
+                        if let Some(v) = overrides.get(hint.as_str()) {
+                            shape_dims.push(*v as i64);
+                        } else {
+                            return Err(ShapeInferenceError::DynamicDim {
+                                input: name.clone(),
+                                dim: hint,
+                            });
+                        }
                     }
                     DimensionValue::DimParam(key) => {
                         if let Some(v) = overrides.get(key.as_str()) {
@@ -258,7 +271,11 @@ fn seed_constant_nodes(
                 let vals = read_int_tensor(t);
                 if !vals.is_empty() {
                     result.const_values.insert(out_name.clone(), vals.clone());
-                    let shape: Vec<i64> = if vals.len() == 1 {
+                    // Keep the tensor's declared rank (e.g. a [1,1,S,S] bool
+                    // mask); only synthesize a flat shape when dims are absent.
+                    let shape: Vec<i64> = if !t.dims.is_empty() {
+                        t.dims.clone()
+                    } else if vals.len() == 1 {
                         Vec::new()
                     } else {
                         vec![vals.len() as i64]
@@ -289,12 +306,8 @@ fn propagate_node_shapes(
             if outputs.is_empty() {
                 continue;
             }
-            if outputs
-                .iter()
-                .all(|o| result.value_shapes.contains_key(o.as_str()))
-            {
-                continue;
-            }
+            // Shapes may have been guessed before an upstream constant (e.g. a
+            // Reshape target) folded; recompute every node and track changes.
 
             if node.op_type.as_str() == "DynamicQuantizeLinear" {
                 if let Some(input_name) = node.input.first() {
@@ -312,6 +325,28 @@ fn propagate_node_shapes(
                             continue;
                         }
                     }
+                }
+            }
+
+            if node.op_type.as_str() == "GroupQueryAttention" {
+                if let Some(shapes) =
+                    crate::onnx::ops::attention::gqa_output_shapes(node, &result.value_shapes)
+                {
+                    let input_type = node
+                        .input
+                        .first()
+                        .and_then(|name| result.value_types.get(name).copied());
+                    for (output, shape) in outputs.iter().zip(shapes) {
+                        if output.is_empty() {
+                            continue;
+                        }
+                        result.value_shapes.entry(output.clone()).or_insert(shape);
+                        if let Some(dtype) = input_type {
+                            result.value_types.entry(output.clone()).or_insert(dtype);
+                        }
+                    }
+                    progress = true;
+                    continue;
                 }
             }
 
@@ -367,21 +402,75 @@ fn propagate_node_shapes(
                 &result.const_values,
             ) {
                 let out_name = outputs[0].to_string();
-                result.value_shapes.entry(out_name.clone()).or_insert(shape);
+                let advanced = result.value_shapes.get(&out_name) != Some(&shape);
+                result.value_shapes.insert(out_name.clone(), shape);
 
                 // Propagate dtype from first input if available.
-                if node.op_type.as_str() == "ConvInteger" {
+                if node.op_type.as_str() == "OneHot" {
+                    // Output takes the type of `values`, not of the indices.
+                    if let Some(values) = node.input.as_slice().get(2) {
+                        let dtype =
+                            result
+                                .value_types
+                                .get(values.as_str())
+                                .copied()
+                                .or_else(|| {
+                                    initializers
+                                        .get(values.as_str())
+                                        .and_then(|t| map_onnx_data_type(t.data_type).ok())
+                                });
+                        if let Some(dtype) = dtype {
+                            result.value_types.insert(out_name.clone(), dtype);
+                        }
+                    }
+                } else if node.op_type.as_str() == "Cast" {
+                    // The output type is the `to` attribute, not the input's.
+                    let to = node
+                        .attribute
+                        .as_slice()
+                        .iter()
+                        .find(|a| a.name.as_str() == "to")
+                        .map(|a| a.i as i32);
+                    if let Some(dtype) = to.and_then(|t| map_onnx_data_type(t).ok()) {
+                        result.value_types.insert(out_name.clone(), dtype);
+                    }
+                } else if matches!(
+                    node.op_type.as_str(),
+                    "Equal"
+                        | "Greater"
+                        | "GreaterOrEqual"
+                        | "Less"
+                        | "LessOrEqual"
+                        | "And"
+                        | "Or"
+                        | "Xor"
+                        | "Not"
+                        | "IsNaN"
+                        | "IsInf"
+                ) {
+                    result.value_types.insert(out_name.clone(), DataType::Uint8);
+                } else if matches!(node.op_type.as_str(), "ConvInteger" | "MatMulInteger") {
                     result
                         .value_types
                         .entry(out_name.clone())
                         .or_insert(DataType::Int32);
+                } else if node.op_type.as_str() == "GatherBlockQuantized" {
+                    // The dequantized output takes the scales' float type, not
+                    // the packed uint8 table's.
+                    if let Some(dtype) =
+                        gather_block_quantized_dtype(node, &result.value_types, initializers)
+                    {
+                        result.value_types.entry(out_name.clone()).or_insert(dtype);
+                    }
                 } else if let Some(first_in) = node.input.as_slice().first() {
                     if let Some(dtype) = result.value_types.get(first_in).cloned() {
                         result.value_types.entry(out_name.clone()).or_insert(dtype);
                     }
                 }
 
-                progress = true;
+                if advanced {
+                    progress = true;
+                }
             }
         }
 
@@ -420,6 +509,44 @@ pub fn infer_node_output_shape(
         | "SimplifiedLayerNormalization"
         | "SkipSimplifiedLayerNormalization"
         | "RotaryEmbedding"
+        | "MoE"
+        | "QMoE"
+        | "CumSum"
+        | "CumProd"
+        | "DequantizeLinear"
+        | "QuantizeLinear"
+        | "Sin"
+        | "Cos"
+        | "Tan"
+        | "Asin"
+        | "Acos"
+        | "Atan"
+        | "Sinh"
+        | "Cosh"
+        | "Asinh"
+        | "Acosh"
+        | "Atanh"
+        | "Floor"
+        | "Ceil"
+        | "Round"
+        | "Sign"
+        | "Reciprocal"
+        | "Identity"
+        | "LeakyRelu"
+        | "Elu"
+        | "Selu"
+        | "Celu"
+        | "Softplus"
+        | "Softsign"
+        | "HardSigmoid"
+        | "HardSwish"
+        | "Mish"
+        | "Clip"
+        | "Not"
+        | "IsNaN"
+        | "IsInf"
+        | "ScatterND"
+        | "ScatterElements"
         | "BatchNormalization"
         | "InstanceNormalization"
         | "Trilu" => {
@@ -430,8 +557,24 @@ pub fn infer_node_output_shape(
             value_shapes.get(ins[0].as_str()).cloned()
         }
 
+        // Where broadcasts its three inputs together.
+        "Where" => {
+            let ins = node.input.as_slice();
+            if ins.len() < 3 {
+                return None;
+            }
+            let mut out: Vec<i64> = Vec::new();
+            for name in ins.iter().take(3) {
+                let shape = value_shapes.get(name.as_str())?;
+                out = broadcast_shape(&out, shape)?;
+            }
+            Some(out)
+        }
+
         // Binary operations with NumPy-style broadcasting semantics.
-        "Add" | "Sub" | "Mul" | "Div" | "Pow" => {
+        // (Min/Max are variadic; two inputs covers the common exports.)
+        "Add" | "Sub" | "Mul" | "Div" | "Mod" | "Pow" | "Equal" | "Greater" | "GreaterOrEqual"
+        | "Less" | "LessOrEqual" | "And" | "Or" | "Xor" | "Min" | "Max" => {
             let ins = node.input.as_slice();
             if ins.len() < 2 {
                 return None;
@@ -465,14 +608,21 @@ pub fn infer_node_output_shape(
         }
 
         // MatMul (2D matrix multiplication)
-        "MatMul" => {
+        "MatMul" | "MatMulInteger" => {
             let ins = node.input.as_slice();
             if ins.len() < 2 {
                 return None;
             }
 
-            let a_shape = value_shapes.get(ins[0].as_str())?;
-            let b_shape = value_shapes.get(ins[1].as_str())?;
+            // Weight operands are often initializers absent from value_shapes.
+            let shape_of = |name: &str| {
+                value_shapes
+                    .get(name)
+                    .cloned()
+                    .or_else(|| initializers.get(name).map(|t| t.dims.clone()))
+            };
+            let a_shape = &shape_of(ins[0].as_str())?;
+            let b_shape = &shape_of(ins[1].as_str())?;
 
             // Handle 2D case: [M, K] @ [K, N] -> [M, N]
             if a_shape.len() >= 2 && b_shape.len() >= 2 {
@@ -492,7 +642,21 @@ pub fn infer_node_output_shape(
             None
         }
 
-        "MatMulNBits" => {
+        "Einsum" => {
+            let equation = node
+                .attribute
+                .iter()
+                .find(|attr| attr.name == "equation")
+                .map(|attr| String::from_utf8_lossy(&attr.s).to_string())?;
+            let input_shapes: Vec<Vec<i64>> = node
+                .input
+                .iter()
+                .map(|name| value_shapes.get(name.as_str()).cloned())
+                .collect::<Option<_>>()?;
+            crate::onnx::ops::einsum::einsum_output_shape(&equation, &input_shapes)
+        }
+
+        "MatMulNBits" | "MatMulBnb4" => {
             let ins = node.input.as_slice();
             if ins.is_empty() {
                 return None;
@@ -529,7 +693,11 @@ pub fn infer_node_output_shape(
                 .map(|a| a.ints.iter().map(|&i| i as usize).collect::<Vec<usize>>())
                 .unwrap_or_else(|| (0..input_shape.len()).rev().collect());
 
-            // Apply permutation
+            // A tracked shape whose rank disagrees with the permutation is a
+            // stale guess from partial propagation - refuse rather than panic.
+            if perm.len() != input_shape.len() || perm.iter().any(|&i| i >= input_shape.len()) {
+                return None;
+            }
             Some(perm.iter().map(|&i| input_shape[i]).collect())
         }
 
@@ -547,17 +715,25 @@ pub fn infer_node_output_shape(
                 .as_slice()
                 .iter()
                 .find(|a| a.name.as_str() == "keepdims")
-                .and_then(|a| if a.i != 0 { Some(a.i != 0) } else { None })
+                .map(|a| a.i != 0)
                 .unwrap_or(true);
 
-            // Get axes attribute
-            let axes: Vec<i64> = node
+            // Axes: attribute (opset < 18) or constant second input (opset 18+).
+            let mut axes: Vec<i64> = node
                 .attribute
                 .as_slice()
                 .iter()
                 .find(|a| a.name.as_str() == "axes")
                 .map(|a| a.ints.clone())
                 .unwrap_or_default();
+            if axes.is_empty() {
+                if let Some(axes_name) = ins.get(1).filter(|n| !n.is_empty()) {
+                    axes = const_values
+                        .get(axes_name.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                }
+            }
 
             if axes.is_empty() {
                 // Reduce all dimensions
@@ -627,20 +803,52 @@ pub fn infer_node_output_shape(
             Some(vec![m, n])
         }
 
-        "Gather" => {
+        "Gather" | "GatherBlockQuantized" => {
             let ins = node.input.as_slice();
             if ins.len() < 2 {
                 return None;
             }
 
-            let data_shape = value_shapes.get(ins[0].as_str())?;
+            let mut data_shape = value_shapes
+                .get(ins[0].as_str())
+                .cloned()
+                .or_else(|| initializers.get(ins[0].as_str()).map(|t| t.dims.clone()))?;
+            // The quantized table packs 8/bits values per byte on its last axis.
+            if op == "GatherBlockQuantized" {
+                let bits = node
+                    .attribute
+                    .as_slice()
+                    .iter()
+                    .find(|a| a.name.as_str() == "bits")
+                    .map(|a| a.i)
+                    .unwrap_or(4);
+                if bits != 4 && bits != 8 {
+                    return None;
+                }
+                // INT4/UINT4 tables (data types 22/21) already have logical dims.
+                let four_bit_dtype = initializers
+                    .get(ins[0].as_str())
+                    .is_some_and(|t| t.data_type == 21 || t.data_type == 22);
+                if !four_bit_dtype {
+                    let last = data_shape.last_mut()?;
+                    *last *= 8 / bits;
+                }
+            }
+            let data_shape = &data_shape;
             let indices_shape = value_shapes.get(ins[1].as_str())?;
 
             let mut axis = node
                 .attribute
                 .as_slice()
                 .iter()
-                .find(|a| a.name.as_str() == "axis")
+                .find(|a| {
+                    a.name.as_str()
+                        == if op == "GatherBlockQuantized" {
+                            "gather_axis"
+                        } else {
+                            "axis"
+                        }
+                })
                 .and_then(|a| if a.i != 0 { Some(a.i) } else { None })
                 .unwrap_or(0);
 
@@ -676,22 +884,32 @@ pub fn infer_node_output_shape(
                 .find(|a| a.name.as_str() == "axes")
                 .map(|a| a.ints.clone())
                 .unwrap_or_default();
-
+            if axes.is_empty() {
+                // Opset 13+: axes is the second input.
+                let axes_name = ins.get(1)?;
+                axes = read_int64_values_from_maps(axes_name.as_str(), initializers, const_values)?;
+            }
             if axes.is_empty() {
                 return None;
             }
 
-            axes.sort();
+            // Negative axes are relative to the output rank.
+            let out_rank = input_shape.len() as i64 + axes.len() as i64;
+            let mut normalized: Vec<i64> = axes
+                .iter()
+                .map(|&a| if a < 0 { a + out_rank } else { a })
+                .collect();
+            if normalized.iter().any(|&a| a < 0 || a >= out_rank) {
+                return None;
+            }
+            normalized.sort_unstable();
+            normalized.dedup();
+            if normalized.len() as i64 + input_shape.len() as i64 != out_rank {
+                return None;
+            }
             let mut output_shape = input_shape;
-            for axis in axes {
-                let idx = if axis < 0 {
-                    (output_shape.len() as i64 + axis + 1) as usize
-                } else {
-                    axis as usize
-                };
-                if idx <= output_shape.len() {
-                    output_shape.insert(idx, 1);
-                }
+            for axis in normalized {
+                output_shape.insert(axis as usize, 1);
             }
             Some(output_shape)
         }
@@ -748,6 +966,13 @@ pub fn infer_node_output_shape(
                 return None;
             }
             let input_shape = value_shapes.get(ins[0].as_str())?;
+            // An empty shape vector broadcasts to the input itself.
+            if const_values
+                .get(ins[1].as_str())
+                .is_some_and(|v| v.is_empty())
+            {
+                return Some(input_shape.clone());
+            }
             let target = read_int64_values_from_maps(ins[1].as_str(), initializers, const_values)?;
             broadcast_shape(input_shape, &target)
         }
@@ -769,29 +994,49 @@ pub fn infer_node_output_shape(
                 .collect()
         }
 
+        "OneHot" => {
+            let ins = node.input.as_slice();
+            let indices = value_shapes.get(ins.first()?.as_str())?;
+            let depth =
+                read_int64_values_from_maps(ins.get(1)?.as_str(), initializers, const_values)?
+                    .first()
+                    .copied()?;
+            let out_rank = indices.len() as i64 + 1;
+            let axis = node
+                .attribute
+                .as_slice()
+                .iter()
+                .find(|a| a.name.as_str() == "axis")
+                .map(|a| a.i)
+                .unwrap_or(-1);
+            let axis = if axis < 0 { axis + out_rank } else { axis };
+            if axis < 0 || axis >= out_rank || depth <= 0 {
+                return None;
+            }
+            let mut out = indices.clone();
+            out.insert(axis as usize, depth);
+            Some(out)
+        }
+
         "Range" => {
             let ins = node.input.as_slice();
             if ins.len() != 3 {
                 return None;
             }
-            let scalar = |name: &str| {
-                read_int64_values_from_maps(name, initializers, const_values)
-                    .and_then(|values| values.first().copied())
-            };
+            // ONNX: number_of_elements = max(ceil((limit - start) / delta), 0).
+            // Computed in f64 so float ranges (dynamo `arange(0.5, n, 1.0)`) work.
+            let scalar = |name: &str| read_range_scalar_f64(name, initializers, const_values);
             let start = scalar(ins[0].as_str())?;
             let limit = scalar(ins[1].as_str())?;
             let delta = scalar(ins[2].as_str())?;
-            let len = if delta > 0 && start < limit {
-                (limit - start).checked_add(delta - 1)? / delta
-            } else if delta < 0 && start > limit {
-                let step = delta.checked_neg()?;
-                (start - limit).checked_add(step - 1)? / step
-            } else if delta == 0 {
+            if delta == 0.0 || !delta.is_finite() {
                 return None;
-            } else {
-                0
-            };
-            Some(vec![len])
+            }
+            let len = ((limit - start) / delta).ceil();
+            if !len.is_finite() {
+                return None;
+            }
+            Some(vec![if len > 0.0 { len as i64 } else { 0 }])
         }
 
         "Concat" => {
@@ -851,7 +1096,9 @@ pub fn infer_node_output_shape(
                 return None;
             }
 
-            let input_shape = value_shapes.get(ins[0].as_str())?;
+            // The data shape is only needed to resolve -1 / 0 target entries;
+            // a fully positive constant target stands on its own.
+            let input_shape_opt = value_shapes.get(ins[0].as_str());
             let shape_input = ins[1].as_str();
             let mut target: Vec<i64> = if let Some(values) = const_values.get(shape_input) {
                 values.clone()
@@ -894,7 +1141,17 @@ pub fn infer_node_output_shape(
                 return None;
             }
 
+            // ONNX: a 0 entry copies the corresponding input dimension.
+            if target.contains(&0) {
+                let input_shape = input_shape_opt?;
+                for (idx, dim) in target.iter_mut().enumerate() {
+                    if *dim == 0 {
+                        *dim = *input_shape.get(idx)?;
+                    }
+                }
+            }
             if target.contains(&-1) {
+                let input_shape = input_shape_opt?;
                 let total_input: i64 = input_shape.iter().product();
                 let known: i64 = target.iter().filter(|&&d| d != -1).product();
                 if known == 0 || total_input % known != 0 {
@@ -1134,7 +1391,7 @@ pub fn infer_node_output_shape(
                     "VALID" if !transpose => (in_dim - dilated_k) / s + 1,
                     "VALID" if transpose => (in_dim - 1) * s + dilated_k,
                     _ => {
-                        // explicit pads (NOTSET) ΓÇö pads layout: [b1, b2, ..., bk, e1, e2, ..., ek]
+                        // explicit pads (NOTSET) - pads layout: [b1, b2, ..., bk, e1, e2, ..., ek]
                         let pad_begin = pads[i];
                         let pad_end = pads[i + spatial_rank];
                         if transpose {
@@ -1224,7 +1481,7 @@ pub fn infer_node_output_shape(
                 }
 
                 let step = steps[i];
-                if step != 1 {
+                if step <= 0 {
                     return None;
                 }
 
@@ -1245,7 +1502,8 @@ pub fn infer_node_output_shape(
                 if end < start {
                     output[axis] = 0;
                 } else {
-                    output[axis] = end - start;
+                    // Strided slices (e.g. sin/cos interleave `[..., 0::2]`).
+                    output[axis] = (end - start + step - 1) / step;
                 }
             }
 
@@ -1253,10 +1511,156 @@ pub fn infer_node_output_shape(
         }
 
         // Resize: when sizes/scales are known constants, output shape is computable.
-        // U-Net decoders (e.g. RMBG) chain Resize → Concat skip → Conv → Shape → Resize.
+        // U-Net decoders (e.g. RMBG) chain Resize -> Concat skip -> Conv -> Shape -> Resize.
         "Resize" => infer_resize_output_shape(node, value_shapes, initializers, const_values),
 
         _ => None,
+    }
+}
+
+/// Decode a float16/float32/float64 tensor whose every element is integral
+/// (e.g. Range start/delta scalars in fp16 exports) into exact i64 values.
+fn integral_float_tensor_as_i64(tensor: &TensorProto) -> Option<Vec<i64>> {
+    if tensor.dims.as_slice().contains(&0) {
+        return None;
+    }
+    let raw = tensor.raw_data.as_slice();
+    let floats: Vec<f64> = if tensor.data_type == TensorProto_DataType::Float as i32 {
+        if !raw.is_empty() {
+            raw.chunks_exact(4)
+                .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect()
+        } else {
+            tensor.float_data.iter().map(|&v| f64::from(v)).collect()
+        }
+    } else if tensor.data_type == TensorProto_DataType::Float16 as i32 {
+        if !raw.is_empty() {
+            raw.chunks_exact(2)
+                .map(|c| f64::from(half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()))
+                .collect()
+        } else {
+            tensor
+                .int32_data
+                .iter()
+                .map(|&v| f64::from(half::f16::from_bits(v as u16).to_f32()))
+                .collect()
+        }
+    } else if tensor.data_type == TensorProto_DataType::Double as i32 {
+        if !raw.is_empty() {
+            raw.chunks_exact(8)
+                .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .collect()
+        } else {
+            tensor.double_data.clone()
+        }
+    } else {
+        return None;
+    };
+    if floats.is_empty() || floats.iter().any(|v| v.fract() != 0.0 || !v.is_finite()) {
+        return None;
+    }
+    Some(floats.into_iter().map(|v| v as i64).collect())
+}
+
+/// Scalar Range operand as i64: integer values from const/initializer maps,
+/// or an integral float initializer (dynamo emits float Range for arange).
+fn read_range_scalar(
+    name: &str,
+    initializers: &HashMap<String, &TensorProto>,
+    const_values: &HashMap<String, Vec<i64>>,
+) -> Option<i64> {
+    if let Some(values) = read_int64_values_from_maps(name, initializers, const_values) {
+        return values.first().copied();
+    }
+    integral_float_tensor_as_i64(initializers.get(name)?).and_then(|v| v.first().copied())
+}
+
+/// Scalar Range operand as f64 (any numeric initializer or folded constant),
+/// used for output-length inference only.
+fn read_range_scalar_f64(
+    name: &str,
+    initializers: &HashMap<String, &TensorProto>,
+    const_values: &HashMap<String, Vec<i64>>,
+) -> Option<f64> {
+    if let Some(values) = read_int64_values_from_maps(name, initializers, const_values) {
+        return values.first().map(|&v| v as f64);
+    }
+    let tensor = initializers.get(name)?;
+    if tensor.dims.as_slice().contains(&0) {
+        return None;
+    }
+    let raw = tensor.raw_data.as_slice();
+    let dtype = tensor.data_type;
+    if dtype == TensorProto_DataType::Float as i32 {
+        if raw.len() >= 4 {
+            return Some(f64::from(f32::from_le_bytes([
+                raw[0], raw[1], raw[2], raw[3],
+            ])));
+        }
+        return tensor.float_data.first().map(|&v| f64::from(v));
+    }
+    if dtype == TensorProto_DataType::Float16 as i32 {
+        if raw.len() >= 2 {
+            return Some(f64::from(
+                half::f16::from_bits(u16::from_le_bytes([raw[0], raw[1]])).to_f32(),
+            ));
+        }
+        return tensor
+            .int32_data
+            .first()
+            .map(|&v| f64::from(half::f16::from_bits(v as u16).to_f32()));
+    }
+    if dtype == TensorProto_DataType::Double as i32 {
+        if raw.len() >= 8 {
+            return Some(f64::from_le_bytes([
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            ]));
+        }
+        return tensor.double_data.first().copied();
+    }
+    None
+}
+
+/// Element type of a value from the tracked types or its initializer.
+fn value_or_initializer_dtype(
+    name: &str,
+    value_types: &HashMap<String, DataType>,
+    initializers: &HashMap<String, &TensorProto>,
+) -> Option<DataType> {
+    if let Some(dtype) = value_types.get(name) {
+        return Some(*dtype);
+    }
+    let tensor = initializers.get(name)?;
+    match tensor.data_type {
+        x if x == TensorProto_DataType::Float as i32 => Some(DataType::Float32),
+        x if x == TensorProto_DataType::Float16 as i32 => Some(DataType::Float16),
+        x if x == TensorProto_DataType::Int32 as i32 => Some(DataType::Int32),
+        x if x == TensorProto_DataType::Int64 as i32 => Some(DataType::Int64),
+        x if x == TensorProto_DataType::Uint8 as i32 => Some(DataType::Uint8),
+        x if x == TensorProto_DataType::Int8 as i32 => Some(DataType::Int8),
+        x if x == TensorProto_DataType::Uint32 as i32 => Some(DataType::Uint32),
+        x if x == TensorProto_DataType::Bool as i32 => Some(DataType::Uint8),
+        _ => None,
+    }
+}
+
+/// Output element type of a GatherBlockQuantized node: the scales' float type.
+fn gather_block_quantized_dtype(
+    node: &NodeProto,
+    value_types: &HashMap<String, DataType>,
+    initializers: &HashMap<String, &TensorProto>,
+) -> Option<DataType> {
+    let scales = node.input.as_slice().get(2)?;
+    if let Some(dtype) = value_types.get(scales.as_str()) {
+        return Some(*dtype);
+    }
+    let tensor = initializers.get(scales.as_str())?;
+    if tensor.data_type == TensorProto_DataType::Float16 as i32 {
+        Some(DataType::Float16)
+    } else if tensor.data_type == TensorProto_DataType::Float as i32 {
+        Some(DataType::Float32)
+    } else {
+        None
     }
 }
 
@@ -1283,6 +1687,17 @@ fn read_int64_values_from_maps(
                     .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
                     .collect(),
             );
+        }
+        if tensor.data_type == TensorProto_DataType::Bool as i32
+            || tensor.data_type == TensorProto_DataType::Uint8 as i32
+            || tensor.data_type == TensorProto_DataType::Int8 as i32
+        {
+            return Some(raw.iter().map(|&b| i64::from(b)).collect());
+        }
+        // Only interpret raw bytes as packed i64 for actual int64 tensors;
+        // decoding e.g. a bool mask this way poisons const folding.
+        if tensor.data_type != TensorProto_DataType::Int64 as i32 {
+            return None;
         }
         return Some(
             raw.chunks_exact(8)
@@ -1565,6 +1980,13 @@ fn fold_binary_const_i64(
                     return None;
                 }
                 av / bv
+            }
+            "Mod" => {
+                if bv == 0 {
+                    return None;
+                }
+                // ONNX Mod fmod=0: result takes the divisor's sign.
+                ((av % bv) + bv) % bv
             }
             "Equal" => {
                 if av == bv {
@@ -2015,7 +2437,10 @@ impl FoldShapeConstantsOptions {
         Self {
             require_positive_dims: true,
             experimental_dynamic_inputs: opts.experimental_dynamic_inputs,
-            fold_where_values: false,
+            // Where must stay foldable here: the early pass may have folded it
+            // from placeholder shapes, and only a refresh with resolved inputs
+            // can correct the value (e.g. torch expand_as target vectors).
+            fold_where_values: true,
             fold_reshape: false,
             fold_unsqueeze_axes: false,
         }
@@ -2067,10 +2492,11 @@ fn value_shape_dims_for_input<'a>(
     None
 }
 
-/// Parse ConstantOfShape `value` attribute (default: int64 zero).
+/// Parse ConstantOfShape `value` attribute (default: float32 zero).
 fn constant_of_shape_fill(node: &NodeProto) -> (DataType, i64) {
-    let mut fill_value: i64 = 0;
-    let mut dtype = DataType::Int64;
+    // ONNX default when `value` is absent: float32 zero.
+    let mut fill_value: i64 = 0f32.to_bits() as i64;
+    let mut dtype = DataType::Float32;
     for attr in node.attribute.as_slice() {
         if attr.name.as_str() != "value" {
             continue;
@@ -2107,7 +2533,7 @@ fn constant_of_shape_fill(node: &NodeProto) -> (DataType, i64) {
     (dtype, fill_value)
 }
 
-/// Fold integer shape subgraphs (Shape/Gather/Concat/Range/Where/…).
+/// Fold integer shape subgraphs (Shape/Gather/Concat/Range/Where/...).
 fn fold_shape_constants(
     graph: &GraphProto,
     value_shapes: &mut HashMap<String, Vec<i64>>,
@@ -2118,8 +2544,15 @@ fn fold_shape_constants(
 ) -> bool {
     let consts_before = const_values.len();
     let mut any_folded = false;
+    let initializers: HashMap<String, &TensorProto> = graph
+        .initializer
+        .as_slice()
+        .iter()
+        .map(|t| (t.name.to_string(), t))
+        .collect();
+    let initializers = &initializers;
 
-    // Cascade Shape → Slice → Concat → Cast within one propagation pass.
+    // Cascade Shape -> Slice -> Concat -> Cast within one propagation pass.
     for _ in 0..16 {
         let pass_before = const_values.len();
 
@@ -2134,7 +2567,25 @@ fn fold_shape_constants(
             // chain instead of keeping stale values (e.g. Resize target sizes).
             let refresh_shape_value = matches!(
                 op_type,
-                "Shape" | "Gather" | "Unsqueeze" | "Squeeze" | "Slice" | "Concat" | "Cast"
+                "Shape"
+                    | "Gather"
+                    | "Unsqueeze"
+                    | "Squeeze"
+                    | "Slice"
+                    | "Concat"
+                    | "Cast"
+                    | "Transpose"
+                    | "Expand"
+                    | "Equal"
+                    | "Where"
+                    | "Range"
+                    | "ConstantOfShape"
+                    | "Add"
+                    | "Sub"
+                    | "Mul"
+                    | "Div"
+                    | "Neg"
+                    | "Reshape"
             );
             if const_values.contains_key(outputs[0].as_str()) && !refresh_shape_value {
                 continue;
@@ -2147,6 +2598,15 @@ fn fold_shape_constants(
                         const_values.get(inputs[0].as_str()).cloned(),
                         const_values.get(inputs[1].as_str()).cloned(),
                     ) {
+                        // An empty const for a non-empty tensor is a stale
+                        // placeholder from an earlier pass; wait for the refresh.
+                        let input_numel: i64 = value_shapes
+                            .get(inputs[0].as_str())
+                            .map(|s| s.iter().product())
+                            .unwrap_or(0);
+                        if data.is_empty() && input_numel > 0 {
+                            continue;
+                        }
                         if target.contains(&-1) {
                             let total: i64 = if data.is_empty() {
                                 1
@@ -2367,8 +2827,10 @@ fn fold_shape_constants(
                                     value_shape_dims.insert(out.clone(), out_dims);
                                 }
                             }
-                            const_values.insert(out.clone(), shape.clone());
-                            let inferred_shape = vec![shape.len() as i64];
+                            let (start, end) = shape_attr_range(node, shape.len());
+                            let sliced = shape[start..end].to_vec();
+                            const_values.insert(out.clone(), sliced.clone());
+                            let inferred_shape = vec![sliced.len() as i64];
                             // Force the correct shape - Shape operation computes exact output shape
                             value_shapes.insert(out.clone(), inferred_shape.clone());
                             value_shapes.insert(sanitize_identifier(&out), inferred_shape);
@@ -2444,7 +2906,7 @@ fn fold_shape_constants(
                         }
                     }
                 }
-            } else if matches!(op_type, "Add" | "Sub" | "Mul" | "Div") {
+            } else if matches!(op_type, "Add" | "Sub" | "Mul" | "Div" | "Mod") {
                 if node.input.as_slice().len() >= 2 {
                     if let (Some(a_name), Some(b_name), Some(out)) = (
                         node.input.as_slice().first(),
@@ -2501,10 +2963,57 @@ fn fold_shape_constants(
                             }
                         }
                         const_values.insert(out.to_string(), vals.clone());
-                        let out_shape = if vals.len() == 1 {
-                            Vec::new()
+                        // Track the real rank change: consumers like Tile need
+                        // the unsqueezed shape, not a flattened vector.
+                        let base_shape = value_shapes.get(inp).cloned().unwrap_or_else(|| {
+                            if vals.len() == 1 {
+                                Vec::new()
+                            } else {
+                                vec![vals.len() as i64]
+                            }
+                        });
+                        let mut axes: Vec<i64> = node
+                            .attribute
+                            .as_slice()
+                            .iter()
+                            .find(|a| a.name.as_str() == "axes")
+                            .map(|a| a.ints.clone())
+                            .unwrap_or_default();
+                        if axes.is_empty() {
+                            if let Some(axes_name) = node.input.as_slice().get(1) {
+                                axes = const_values
+                                    .get(axes_name.as_str())
+                                    .cloned()
+                                    .unwrap_or_default();
+                            }
+                        }
+                        let out_shape = if op_type == "Unsqueeze" {
+                            let out_rank = base_shape.len() as i64 + axes.len() as i64;
+                            let mut norm: Vec<i64> = axes
+                                .iter()
+                                .map(|&a| if a < 0 { a + out_rank } else { a })
+                                .collect();
+                            norm.sort_unstable();
+                            let mut s = base_shape;
+                            for a in norm {
+                                let idx = a.clamp(0, s.len() as i64) as usize;
+                                s.insert(idx, 1);
+                            }
+                            s
+                        } else if axes.is_empty() {
+                            base_shape.into_iter().filter(|&d| d != 1).collect()
                         } else {
-                            vec![vals.len() as i64]
+                            let rank = base_shape.len() as i64;
+                            let norm: Vec<usize> = axes
+                                .iter()
+                                .map(|&a| (if a < 0 { a + rank } else { a }) as usize)
+                                .collect();
+                            base_shape
+                                .into_iter()
+                                .enumerate()
+                                .filter(|(i, _)| !norm.contains(i))
+                                .map(|(_, d)| d)
+                                .collect()
                         };
                         value_shapes.insert(out.to_string(), out_shape);
                         if let Some(dtype) = value_types.get(inp).cloned() {
@@ -2513,7 +3022,7 @@ fn fold_shape_constants(
                     }
                 }
             } else if op_type == "Cast" {
-                // Integer Cast is common in Resize sizes subgraphs (Gather/Concat → Cast → Concat).
+                // Integer Cast is common in Resize sizes subgraphs (Gather/Concat -> Cast -> Concat).
                 if let (Some(inp), Some(out)) = (
                     node.input.as_slice().first(),
                     node.output.as_slice().first(),
@@ -2527,9 +3036,24 @@ fn fold_shape_constants(
                         .unwrap_or(0);
                     let to_int = to_type == TensorProto_DataType::Int64 as i64
                         || to_type == TensorProto_DataType::Int32 as i64
+                        || to_type == TensorProto_DataType::Bool as i64
                         || to_type == 0; // missing attr: still allow int const passthrough
-                    if to_int {
-                        if let Some(vals) = const_values.get(inp).cloned() {
+                                         // Integer consts survive a cast to float exactly (e.g. a folded
+                                         // sequence length feeding a float Range limit).
+                    let to_float = to_type == TensorProto_DataType::Float as i64
+                        || to_type == TensorProto_DataType::Float16 as i64
+                        || to_type == TensorProto_DataType::Double as i64;
+                    if to_int || to_float {
+                        // fp16 exports route Range scalars through Cast(float16 init);
+                        // integral float initializers fold exactly.
+                        let folded = const_values.get(inp).cloned().or_else(|| {
+                            graph
+                                .initializer
+                                .iter()
+                                .find(|t| t.name == *inp)
+                                .and_then(|t| integral_float_tensor_as_i64(t))
+                        });
+                        if let Some(vals) = folded {
                             if options.experimental_dynamic_inputs {
                                 if let Some(dims) = value_shape_dims
                                     .get(inp)
@@ -2548,6 +3072,64 @@ fn fold_shape_constants(
                                 }
                             });
                             value_shapes.insert(out.to_string(), out_shape);
+                            let out_type = if to_type == TensorProto_DataType::Float16 as i64 {
+                                DataType::Float16
+                            } else if to_float {
+                                DataType::Float32
+                            } else {
+                                DataType::Int64
+                            };
+                            value_types.insert(out.to_string(), out_type);
+                        }
+                    }
+                }
+            } else if op_type == "Neg" {
+                if let (Some(inp), Some(out)) = (
+                    node.input.as_slice().first(),
+                    node.output.as_slice().first(),
+                ) {
+                    if let Some(vals) = const_values.get(inp.as_str()).cloned() {
+                        const_values.insert(out.to_string(), vals.iter().map(|v| -v).collect());
+                        if let Some(shape) = value_shapes.get(inp.as_str()).cloned() {
+                            value_shapes.insert(out.to_string(), shape);
+                        }
+                        if let Some(dtype) = value_types.get(inp.as_str()).cloned() {
+                            value_types.insert(out.to_string(), dtype);
+                        }
+                    }
+                }
+            } else if op_type == "Transpose" {
+                // Fold Transpose over small 2-D integer consts (pad-spec chains:
+                // build [[l,r],...] -> reverse -> transpose -> flatten).
+                if let (Some(inp), Some(out)) = (
+                    node.input.as_slice().first(),
+                    node.output.as_slice().first(),
+                ) {
+                    if let (Some(data), Some(shape)) = (
+                        const_values.get(inp.as_str()).cloned(),
+                        value_shapes.get(inp.as_str()).cloned(),
+                    ) {
+                        let perm: Vec<usize> = node
+                            .attribute
+                            .as_slice()
+                            .iter()
+                            .find(|a| a.name.as_str() == "perm")
+                            .map(|a| a.ints.iter().map(|&i| i as usize).collect())
+                            .unwrap_or_else(|| (0..shape.len()).rev().collect());
+                        if shape.len() == 2
+                            && perm == [1, 0]
+                            && shape.iter().all(|&d| d > 0)
+                            && (shape[0] * shape[1]) as usize == data.len()
+                        {
+                            let (r, c) = (shape[0] as usize, shape[1] as usize);
+                            let mut t = Vec::with_capacity(data.len());
+                            for j in 0..c {
+                                for i in 0..r {
+                                    t.push(data[i * c + j]);
+                                }
+                            }
+                            const_values.insert(out.to_string(), t);
+                            value_shapes.insert(out.to_string(), vec![shape[1], shape[0]]);
                             value_types.insert(out.to_string(), DataType::Int64);
                         }
                     }
@@ -2571,13 +3153,42 @@ fn fold_shape_constants(
                                 && ends.len() == starts.len()
                                 && steps.len() == starts.len()
                             {
+                                // Full reverse along axis 0 (torch.flip export):
+                                // reorder rows of the (flat) const payload.
+                                if axes == [0] && steps == [-1] && starts.len() == 1 {
+                                    let dim0 = value_shapes
+                                        .get(data_name.as_str())
+                                        .and_then(|s| s.first().copied())
+                                        .unwrap_or(data.len() as i64);
+                                    let covers_all = (starts[0] == -1 || starts[0] >= dim0 - 1)
+                                        && (ends[0] <= -dim0 || ends[0] <= i64::MIN + 1);
+                                    if covers_all && dim0 > 0 && data.len() as i64 % dim0 == 0 {
+                                        let row = data.len() / dim0 as usize;
+                                        let mut rev = Vec::with_capacity(data.len());
+                                        for chunk in data.chunks(row).rev() {
+                                            rev.extend_from_slice(chunk);
+                                        }
+                                        const_values.insert(out.to_string(), rev);
+                                        if let Some(shape) =
+                                            value_shapes.get(data_name.as_str()).cloned()
+                                        {
+                                            value_shapes.insert(out.to_string(), shape);
+                                        }
+                                        value_types.insert(out.to_string(), DataType::Int64);
+                                    }
+                                }
                                 // Only the common 1-D shape-vector case is folded here.
                                 if axes == [0]
                                     && steps == [1]
                                     && starts.len() == 1
                                     && ends.len() == 1
                                 {
-                                    let start = starts[0].max(0) as usize;
+                                    // Negative indices count from the end (e.g. shape[-1:]).
+                                    let start = if starts[0] < 0 {
+                                        (data.len() as i64 + starts[0]).max(0) as usize
+                                    } else {
+                                        (starts[0] as usize).min(data.len())
+                                    };
                                     let end = if ends[0] < 0 {
                                         (data.len() as i64 + ends[0]).max(0) as usize
                                     } else {
@@ -2639,19 +3250,12 @@ fn fold_shape_constants(
                         }
 
                         // Range(start, limit, delta) -> [start, start+delta, start+2*delta, ...]
-                        if let (Some(start_vals), Some(limit_vals), Some(delta_vals)) = (
-                            const_values.get(start_name),
-                            const_values.get(limit_name),
-                            const_values.get(delta_name),
+                        if let (Some(start), Some(limit), Some(delta)) = (
+                            read_range_scalar(start_name, initializers, const_values),
+                            read_range_scalar(limit_name, initializers, const_values),
+                            read_range_scalar(delta_name, initializers, const_values),
                         ) {
-                            if !start_vals.is_empty()
-                                && !limit_vals.is_empty()
-                                && !delta_vals.is_empty()
                             {
-                                let start = start_vals[0];
-                                let limit = limit_vals[0];
-                                let delta = delta_vals[0];
-
                                 let mut range_vals = Vec::new();
                                 if delta > 0 {
                                     let mut current = start;
@@ -2668,12 +3272,18 @@ fn fold_shape_constants(
                                 }
 
                                 if let Some(out) = node.output.as_slice().first() {
+                                    let dtype = value_or_initializer_dtype(
+                                        start_name,
+                                        value_types,
+                                        initializers,
+                                    )
+                                    .unwrap_or(DataType::Int64);
                                     const_values.insert(out.to_string(), range_vals.clone());
                                     let out_shape = vec![range_vals.len() as i64];
                                     // Force the correct shape - Range computes exact output shape
                                     value_shapes.insert(out.to_string(), out_shape.clone());
                                     value_shapes.insert(sanitize_identifier(out), out_shape);
-                                    value_types.insert(out.to_string(), DataType::Int64);
+                                    value_types.insert(out.to_string(), dtype);
                                 }
                             }
                         }
@@ -2704,6 +3314,7 @@ fn fold_shape_constants(
             } else if op_type == "Concat" {
                 // Concatenate constant inputs (often used to build shape tensors)
                 if let Some(out) = node.output.as_slice().first() {
+                    let mut per_input: Vec<Vec<i64>> = Vec::new();
                     let mut concatenated: Vec<i64> = Vec::new();
                     let mut all_const = true;
                     for inp in node.input.as_slice() {
@@ -2711,10 +3322,81 @@ fn fold_shape_constants(
                             const_values_for_input(graph, inp.as_str(), const_values)
                         {
                             concatenated.extend_from_slice(&vals);
+                            per_input.push(vals);
                         } else {
                             all_const = false;
                             break;
                         }
+                    }
+
+                    // N-D constant concat (e.g. folded meshgrid index tensors):
+                    // block-copy along the (normalized) axis.
+                    let nd_folded = if all_const {
+                        (|| {
+                            let shapes: Vec<Vec<i64>> = node
+                                .input
+                                .as_slice()
+                                .iter()
+                                .map(|i| value_shapes.get(i.as_str()).cloned())
+                                .collect::<Option<_>>()?;
+                            let rank = shapes.first()?.len();
+                            if rank <= 1 || shapes.iter().any(|s| s.len() != rank) {
+                                return None;
+                            }
+                            let mut axis = node
+                                .attribute
+                                .as_slice()
+                                .iter()
+                                .find(|a| a.name.as_str() == "axis")
+                                .map(|a| a.i)
+                                .unwrap_or(0);
+                            if axis < 0 {
+                                axis += rank as i64;
+                            }
+                            let ax = usize::try_from(axis).ok().filter(|&a| a < rank)?;
+                            let base = &shapes[0];
+                            for s in &shapes {
+                                for d in 0..rank {
+                                    if d != ax && s[d] != base[d] {
+                                        return None;
+                                    }
+                                }
+                                if shape_numel(s)?
+                                    != per_input[shapes
+                                        .iter()
+                                        .position(|x| std::ptr::eq(x, s))
+                                        .unwrap_or(0)]
+                                    .len()
+                                {
+                                    return None;
+                                }
+                            }
+                            let inner: i64 = base[ax + 1..].iter().product();
+                            let outer: i64 = base[..ax].iter().product();
+                            if inner <= 0 || outer <= 0 {
+                                return None;
+                            }
+                            let mut out_shape = base.clone();
+                            out_shape[ax] = shapes.iter().map(|s| s[ax]).sum();
+                            let mut values = Vec::with_capacity(shape_numel(&out_shape)?);
+                            for o in 0..outer as usize {
+                                for (vals, s) in per_input.iter().zip(&shapes) {
+                                    let block = (s[ax] * inner) as usize;
+                                    let start = o * block;
+                                    values.extend_from_slice(vals.get(start..start + block)?);
+                                }
+                            }
+                            Some((values, out_shape))
+                        })()
+                    } else {
+                        None
+                    };
+                    if let Some((values, out_shape)) = nd_folded {
+                        const_values.insert(out.to_string(), values);
+                        value_shapes.insert(out.to_string(), out_shape.clone());
+                        value_shapes.insert(sanitize_identifier(out), out_shape);
+                        value_types.insert(out.to_string(), DataType::Int64);
+                        continue;
                     }
 
                     // Handle axis=0 or axis=-1 (common for shape building)
@@ -2762,6 +3444,75 @@ fn fold_shape_constants(
                         value_shapes.insert(out.to_string(), out_shape.clone());
                         value_shapes.insert(sanitize_identifier(out), out_shape);
                         value_types.insert(out.to_string(), DataType::Int64);
+                    }
+                }
+            } else if op_type == "Expand" {
+                // Materialize Expand over integer consts (Swin/roll meshgrid
+                // index construction). Bounded to keep folded payloads small.
+                if let (Some(data_name), Some(shape_name), Some(out)) = (
+                    node.input.as_slice().first(),
+                    node.input.as_slice().get(1),
+                    node.output.as_slice().first(),
+                ) {
+                    if let (Some(data), Some(target)) = (
+                        const_values.get(data_name.as_str()).cloned(),
+                        const_values.get(shape_name.as_str()).cloned(),
+                    ) {
+                        let data_shape = value_shapes
+                            .get(data_name.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                if data.len() == 1 {
+                                    Vec::new()
+                                } else {
+                                    vec![data.len() as i64]
+                                }
+                            });
+                        let folded = (|| {
+                            // Bidirectional broadcast (torch -1 keeps input dim).
+                            let rank = data_shape.len().max(target.len());
+                            let mut out_shape = Vec::with_capacity(rank);
+                            for i in 0..rank {
+                                let d = if i + data_shape.len() >= rank {
+                                    data_shape[i + data_shape.len() - rank]
+                                } else {
+                                    1
+                                };
+                                let t = if i + target.len() >= rank {
+                                    target[i + target.len() - rank]
+                                } else {
+                                    1
+                                };
+                                let t = if t == -1 { d } else { t };
+                                if d != t && d != 1 && t != 1 {
+                                    return None;
+                                }
+                                out_shape.push(d.max(t));
+                            }
+                            let numel = shape_numel(&out_shape)?;
+                            if numel > 1_000_000 || data.is_empty() {
+                                return None;
+                            }
+                            let mut values = Vec::with_capacity(numel);
+                            for idx in 0..numel {
+                                let src = linear_index_for_broadcast_operand(
+                                    idx,
+                                    &out_shape,
+                                    &data_shape,
+                                )?;
+                                values.push(*data.get(src)?);
+                            }
+                            Some((values, out_shape))
+                        })();
+                        if let Some((values, out_shape)) = folded {
+                            const_values.insert(out.to_string(), values);
+                            value_shapes.insert(out.to_string(), out_shape);
+                            if let Some(dtype) = value_types.get(data_name.as_str()).copied() {
+                                value_types.insert(out.to_string(), dtype);
+                            } else {
+                                value_types.insert(out.to_string(), DataType::Int64);
+                            }
+                        }
                     }
                 }
             } else if op_type == "ConstantOfShape" {
@@ -2834,6 +3585,35 @@ fn fold_shape_constants(
                                 value_shapes.insert(out.to_string(), out_shape.clone());
                                 value_shapes.insert(sanitize_identifier(out), out_shape);
                                 value_types.insert(out.to_string(), DataType::Uint8);
+                            }
+                        }
+                    }
+                }
+            } else if matches!(op_type, "Add" | "Sub" | "Mul" | "Div" | "Mod") {
+                // Integer arithmetic over folded shape scalars/vectors (e.g.
+                // `Mul(Gather(Shape(x), 0), num_heads)` in attention reshape chains).
+                if node.input.as_slice().len() >= 2 {
+                    if let (Some(a_name), Some(b_name), Some(out)) = (
+                        node.input.as_slice().first(),
+                        node.input.as_slice().get(1),
+                        node.output.as_slice().first(),
+                    ) {
+                        if let (Some(a), Some(b)) =
+                            (const_values.get(a_name), const_values.get(b_name))
+                        {
+                            let a_shape = const_shape_for_folding(a_name, a, value_shapes);
+                            let b_shape = const_shape_for_folding(b_name, b, value_shapes);
+                            if let Some((result_vals, out_shape)) =
+                                fold_binary_const_i64(op_type, a, b, &a_shape, &b_shape)
+                            {
+                                const_values.insert(out.to_string(), result_vals);
+                                value_shapes.insert(out.to_string(), out_shape.clone());
+                                value_shapes.insert(sanitize_identifier(out), out_shape);
+                                let dtype = value_types
+                                    .get(a_name.as_str())
+                                    .copied()
+                                    .unwrap_or(DataType::Int64);
+                                value_types.insert(out.to_string(), dtype);
                             }
                         }
                     }
@@ -2962,7 +3742,115 @@ fn fold_integer_constants(graph: &GraphProto, ctx: &mut InferenceResult) -> bool
     )
 }
 
-fn read_int_tensor(tensor: &TensorProto) -> Vec<i64> {
+/// Per-element shapes of a SplitToSequence with static input shape and
+/// constant split sizes (mirrors the conversion-time lowering).
+fn split_to_sequence_element_shapes(
+    node: &NodeProto,
+    value_shapes: &HashMap<String, Vec<i64>>,
+    initializers: &HashMap<String, &TensorProto>,
+    const_values: &HashMap<String, Vec<i64>>,
+) -> Option<Vec<Vec<i64>>> {
+    let ins = node.input.as_slice();
+    let input_shape = value_shapes.get(ins.first()?.as_str())?;
+    let rank = input_shape.len();
+    let mut axis = node
+        .attribute
+        .as_slice()
+        .iter()
+        .find(|a| a.name.as_str() == "axis")
+        .map(|a| a.i)
+        .unwrap_or(0);
+    if axis < 0 {
+        axis += rank as i64;
+    }
+    let axis = usize::try_from(axis).ok().filter(|&a| a < rank)?;
+    let dim = input_shape[axis];
+
+    let sizes: Vec<i64> = match ins.get(1).filter(|n| !n.is_empty()) {
+        Some(name) => {
+            let values = const_values
+                .get(name.as_str())
+                .cloned()
+                .or_else(|| initializers.get(name.as_str()).map(|t| read_int_tensor(t)))
+                .filter(|v| !v.is_empty())?;
+            let is_scalar = value_shapes
+                .get(name.as_str())
+                .map(|s| s.is_empty())
+                .unwrap_or(values.len() == 1);
+            if is_scalar && values.len() == 1 {
+                let chunk = values[0].max(1);
+                let mut sizes = vec![chunk; (dim / chunk) as usize];
+                if dim % chunk != 0 {
+                    sizes.push(dim % chunk);
+                }
+                sizes
+            } else {
+                values
+            }
+        }
+        None => vec![1; usize::try_from(dim).ok()?],
+    };
+    if sizes.iter().sum::<i64>() != dim || sizes.iter().any(|&s| s <= 0) {
+        return None;
+    }
+    Some(
+        sizes
+            .iter()
+            .map(|&s| {
+                let mut shape = input_shape.clone();
+                shape[axis] = s;
+                shape
+            })
+            .collect(),
+    )
+}
+
+/// Apply ONNX `Shape` start/end attributes (dynamo exports slice shapes,
+/// e.g. `Shape(x, start=0, end=1)` for the batch dim).
+pub(crate) fn shape_attr_range(node: &NodeProto, rank: usize) -> (usize, usize) {
+    let rank_i = rank as i64;
+    let norm = |v: i64| -> usize { v.clamp(-rank_i, rank_i).rem_euclid(rank_i.max(1)) as usize };
+    let mut start = 0usize;
+    let mut end = rank;
+    for attr in node.attribute.as_slice() {
+        match attr.name.as_str() {
+            "start" => start = norm(attr.i),
+            "end" => end = if attr.i >= rank_i { rank } else { norm(attr.i) },
+            _ => {}
+        }
+    }
+    (start.min(rank), end.clamp(start.min(rank), rank))
+}
+
+/// ONNX RNN family output shapes: Y [seq, dirs, batch, hidden],
+/// Y_h/Y_c [dirs, batch, hidden].
+fn rnn_output_shapes(
+    node: &NodeProto,
+    value_shapes: &HashMap<String, Vec<i64>>,
+) -> Option<Vec<Vec<i64>>> {
+    let ins = node.input.as_slice();
+    let x = value_shapes.get(ins.first()?.as_str())?;
+    let w = value_shapes.get(ins.get(1)?.as_str())?;
+    if x.len() != 3 || w.len() != 3 {
+        return None;
+    }
+    let (seq, batch) = (x[0], x[1]);
+    let dirs = w[0];
+    let hidden = node
+        .attribute
+        .as_slice()
+        .iter()
+        .find(|a| a.name.as_str() == "hidden_size")
+        .map(|a| a.i)
+        .filter(|&h| h > 0)?;
+    Some(vec![
+        vec![seq, dirs, batch, hidden],
+        vec![dirs, batch, hidden],
+        vec![dirs, batch, hidden],
+    ])
+}
+
+pub(crate) fn read_int_tensor(tensor: &TensorProto) -> Vec<i64> {
     let raw = tensor.raw_data.as_slice();
     if !raw.is_empty() {
         match tensor.data_type {
@@ -2970,10 +3858,19 @@ fn read_int_tensor(tensor: &TensorProto) -> Vec<i64> {
                 .chunks_exact(4)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
                 .collect(),
-            _ => raw
+            x if x == TensorProto_DataType::Bool as i32
+                || x == TensorProto_DataType::Uint8 as i32
+                || x == TensorProto_DataType::Int8 as i32 =>
+            {
+                raw.iter().map(|&b| i64::from(b)).collect()
+            }
+            x if x == TensorProto_DataType::Int64 as i32 => raw
                 .chunks_exact(8)
                 .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
                 .collect(),
+            // Never reinterpret non-integer payloads (float weights, bool
+            // masks were handled above) as packed i64 - it poisons folding.
+            _ => Vec::new(),
         }
     } else if !tensor.int64_data.as_slice().is_empty() {
         tensor.int64_data.as_slice().to_vec()
@@ -3008,6 +3905,7 @@ pub fn propagate_shapes_and_fold_constants(
 ) {
     // Propagate shapes and fold constant shape expressions in a few passes
     for _ in 0..24 {
+        let mut shapes_changed = false;
         if options.optimize {
             let max_iterations = 10;
             for iteration in 0..max_iterations {
@@ -3019,9 +3917,13 @@ pub fn propagate_shapes_and_fold_constants(
                         .as_slice()
                         .iter()
                         .all(|out| value_shapes.contains_key(out.as_str()));
-                    if all_outputs_known {
-                        continue;
-                    }
+                    // Shapes recorded from partial information (e.g. the
+                    // binary-broadcast single-input guess) go stale once more
+                    // inputs resolve. Every inference arm is exact given
+                    // resolved inputs and returns None otherwise, so always
+                    // recomputing is idempotent; multi-output special cases
+                    // above keep their or_insert semantics.
+                    let _ = all_outputs_known;
 
                     if onnx_node.op_type.as_str() == "DynamicQuantizeLinear" {
                         if let Some(input_name) = onnx_node.input.first() {
@@ -3039,6 +3941,101 @@ pub fn propagate_shapes_and_fold_constants(
                         }
                     }
 
+                    if onnx_node.op_type.as_str() == "GroupQueryAttention" {
+                        if let Some(shapes) =
+                            crate::onnx::ops::attention::gqa_output_shapes(onnx_node, value_shapes)
+                        {
+                            for (output, shape) in onnx_node.output.iter().zip(shapes) {
+                                if !output.is_empty() {
+                                    value_shapes.insert(output.to_string(), shape);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Sequences: track per-element shapes under `{name}__seq{i}`
+                    // so SequenceAt consumers resolve (mirrors the conversion).
+                    if onnx_node.op_type.as_str() == "SplitToSequence" {
+                        if let Some(elems) = split_to_sequence_element_shapes(
+                            onnx_node,
+                            value_shapes,
+                            initializers,
+                            const_values,
+                        ) {
+                            if let Some(seq_name) = onnx_node.output.first() {
+                                let dtype = onnx_node
+                                    .input
+                                    .first()
+                                    .and_then(|n| value_types.get(n.as_str()).copied());
+                                for (i, shape) in elems.iter().enumerate() {
+                                    let key = format!("{}__seq{i}", sanitize_identifier(seq_name));
+                                    value_shapes.insert(key.clone(), shape.clone());
+                                    if let Some(dtype) = dtype {
+                                        value_types.insert(key, dtype);
+                                    }
+                                }
+                                value_shapes.insert(
+                                    format!("{}__seqlen", sanitize_identifier(seq_name)),
+                                    vec![elems.len() as i64],
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    if onnx_node.op_type.as_str() == "SequenceAt" {
+                        let resolved = (|| {
+                            let ins = onnx_node.input.as_slice();
+                            let seq = sanitize_identifier(ins.first()?);
+                            let count = value_shapes
+                                .get(&format!("{seq}__seqlen"))?
+                                .first()
+                                .copied()?;
+                            let mut idx = const_values
+                                .get(ins.get(1)?.as_str())
+                                .and_then(|v| v.first().copied())
+                                .or_else(|| {
+                                    initializers
+                                        .get(ins.get(1)?.as_str())
+                                        .and_then(|t| read_int_tensor(t).first().copied())
+                                })?;
+                            if idx < 0 {
+                                idx += count;
+                            }
+                            value_shapes.get(&format!("{seq}__seq{idx}")).cloned()
+                        })();
+                        if let (Some(shape), Some(out)) = (resolved, onnx_node.output.first()) {
+                            value_shapes.insert(out.to_string(), shape);
+                            if let Some(dtype) = onnx_node
+                                .input
+                                .first()
+                                .map(|n| format!("{}__seq0", sanitize_identifier(n)))
+                                .and_then(|k| value_types.get(&k).copied())
+                            {
+                                value_types.insert(out.to_string(), dtype);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if matches!(onnx_node.op_type.as_str(), "LSTM" | "GRU" | "RNN") {
+                        if let Some(shapes) = rnn_output_shapes(onnx_node, value_shapes) {
+                            let dtype = onnx_node
+                                .input
+                                .first()
+                                .and_then(|n| value_types.get(n.as_str()).copied());
+                            for (output, shape) in onnx_node.output.iter().zip(shapes) {
+                                if !output.is_empty() {
+                                    value_shapes.insert(output.to_string(), shape);
+                                    if let Some(dtype) = dtype {
+                                        value_types.insert(output.to_string(), dtype);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
                     if onnx_node.op_type.as_str() == "Split" {
                         if let Some(shapes) = infer_split_output_shapes(
                             onnx_node,
@@ -3053,14 +4050,47 @@ pub fn propagate_shapes_and_fold_constants(
                         }
                     }
 
-                    if let Some(inferred) =
-                        infer_node_output_shape(onnx_node, value_shapes, initializers, const_values)
+                    let inferred_opt = infer_node_output_shape(
+                        onnx_node,
+                        value_shapes,
+                        initializers,
+                        const_values,
+                    );
+                    if std::env::var("O2W_TRACE").is_ok()
+                        && onnx_node
+                            .output
+                            .first()
+                            .is_some_and(|o| o.contains("layers.0/self_attn/Reshape_output_0"))
                     {
+                        eprintln!(
+                            "[opt-loop] {} stored={:?} inferred={:?} in0={:?}",
+                            onnx_node.output[0],
+                            value_shapes.get(onnx_node.output[0].as_str()),
+                            inferred_opt,
+                            onnx_node
+                                .input
+                                .first()
+                                .map(|i| value_shapes.get(i.as_str()))
+                        );
+                    }
+                    if let Some(inferred) = inferred_opt {
                         if let Some(output_name) = onnx_node.output.as_slice().first() {
                             // Force the correct shape - shape inference computes exact output shape
+                            if value_shapes.get(output_name.as_str()) != Some(&inferred) {
+                                shapes_changed = true;
+                            }
                             value_shapes.insert(output_name.to_string(), inferred);
-                            if onnx_node.op_type.as_str() == "ConvInteger" {
+                            if matches!(onnx_node.op_type.as_str(), "ConvInteger" | "MatMulInteger")
+                            {
                                 value_types.insert(output_name.to_string(), DataType::Int32);
+                            } else if onnx_node.op_type.as_str() == "GatherBlockQuantized" {
+                                if let Some(dtype) = gather_block_quantized_dtype(
+                                    onnx_node,
+                                    value_types,
+                                    initializers,
+                                ) {
+                                    value_types.insert(output_name.to_string(), dtype);
+                                }
                             }
                         }
                     }
@@ -3083,13 +4113,38 @@ pub fn propagate_shapes_and_fold_constants(
         // If we know the input_ids shape (batch, seq), upgrade any lone hidden-dim
         // tensors (length-1 shapes) to [batch, seq, hidden] to unblock downstream
         // matmul/reshape resolution in decoder graphs that lost batch/seq dims.
+        // Tensors whose rank the model declares (value_info/inputs/outputs) or
+        // that are initializers keep their genuine 1-D shapes (e.g. a rotary
+        // Range output) - only speculatively-shaped values are upgraded.
         if let Some(ids_shape) = value_shapes.get("input_ids") {
             if ids_shape.len() == 2 {
+                let declared_rank1: HashSet<&str> = graph
+                    .value_info
+                    .iter()
+                    .chain(graph.input.iter())
+                    .chain(graph.output.iter())
+                    .filter(|vi| {
+                        vi.r#type
+                            .as_ref()
+                            .and_then(|t| t.value.as_ref())
+                            .is_some_and(|v| match v {
+                                TypeProtoValue::TensorType(tt) => {
+                                    tt.shape.as_ref().is_some_and(|s| s.dim.len() == 1)
+                                }
+                                _ => false,
+                            })
+                    })
+                    .map(|vi| vi.name.as_str())
+                    .collect();
                 let (batch, seq) = (ids_shape[0], ids_shape[1]);
                 let upgrades: Vec<(String, Vec<i64>)> = value_shapes
                     .iter()
                     .filter_map(|(k, v)| {
-                        if v.len() == 1 && v[0] > 1 {
+                        if v.len() == 1
+                            && v[0] > 1
+                            && !declared_rank1.contains(k.as_str())
+                            && !initializers.contains_key(k)
+                        {
                             Some((k.clone(), vec![batch, seq, v[0]]))
                         } else {
                             None
@@ -3119,7 +4174,9 @@ pub fn propagate_shapes_and_fold_constants(
             // at least one node folded this pass
         }
 
-        if const_values.len() == consts_before {
+        // In-place shape corrections (stale broadcast guesses healing as more
+        // inputs resolve) count as progress even when no new const appeared.
+        if const_values.len() == consts_before && !shapes_changed {
             break;
         }
     }
@@ -3384,6 +4441,193 @@ mod tests {
     }
 
     #[test]
+    fn range_shape_handles_float_initializers() {
+        // dynamo: arange(0.5, 14.0, 1.0) -> 14 elements
+        let f32_scalar = |name: &str, v: f32| TensorProto {
+            name: name.to_string(),
+            data_type: TensorProto_DataType::Float as i32,
+            raw_data: v.to_le_bytes().to_vec(),
+            ..Default::default()
+        };
+        let start = f32_scalar("start", 0.5);
+        let delta = f32_scalar("delta", 1.0);
+        let initializers =
+            HashMap::from([("start".to_string(), &start), ("delta".to_string(), &delta)]);
+        let const_values = HashMap::from([("limit".to_string(), vec![14])]);
+        let node = shape_node("Range", &["start", "limit", "delta"]);
+        assert_eq!(
+            infer_node_output_shape(&node, &HashMap::new(), &initializers, &const_values),
+            Some(vec![14])
+        );
+    }
+
+    #[test]
+    fn shape_attr_range_slices_shape_vector() {
+        use crate::protos::onnx::AttributeProto;
+        let mut node = shape_node("Shape", &["input"]);
+        assert_eq!(shape_attr_range(&node, 4), (0, 4));
+        node.attribute = vec![
+            AttributeProto {
+                name: "start".to_string(),
+                i: 0,
+                ..Default::default()
+            },
+            AttributeProto {
+                name: "end".to_string(),
+                i: 1,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(shape_attr_range(&node, 4), (0, 1));
+        node.attribute[0].i = -2;
+        node.attribute[1].i = 100;
+        assert_eq!(shape_attr_range(&node, 4), (2, 4));
+
+        // Folded Shape output honours the range.
+        let graph = GraphProto {
+            node: vec![node],
+            ..Default::default()
+        };
+        let mut value_shapes = HashMap::from([("input".to_string(), vec![1, 3, 224, 224])]);
+        let mut value_types = HashMap::new();
+        let mut const_values = HashMap::new();
+        let mut value_shape_dims = HashMap::new();
+        propagate_shapes_and_fold_constants(
+            &graph,
+            &HashMap::new(),
+            &mut value_shapes,
+            &mut value_types,
+            &mut const_values,
+            &mut value_shape_dims,
+            &PropagateOptions {
+                optimize: true,
+                experimental_dynamic_inputs: false,
+            },
+        );
+        assert_eq!(const_values.get("output"), Some(&vec![224, 224]));
+        assert_eq!(value_shapes.get("output"), Some(&vec![2]));
+    }
+
+    #[test]
+    fn unsqueeze_shape_reads_axes_input_with_negative_axes() {
+        let node = shape_node("Unsqueeze", &["input", "axes"]);
+        assert_eq!(
+            infer_test_node(&node, &[14, 14], &[("axes", vec![-1])]),
+            Some(vec![14, 14, 1])
+        );
+        assert_eq!(
+            infer_test_node(&node, &[14, 14], &[("axes", vec![0, -1])]),
+            Some(vec![1, 14, 14, 1])
+        );
+        assert_eq!(
+            infer_test_node(&node, &[14, 14], &[("axes", vec![5])]),
+            None
+        );
+    }
+
+    #[test]
+    fn cast_output_type_follows_to_attribute() {
+        use crate::onnx::test_models::prelude::*;
+        let m = model(
+            17,
+            graph(
+                "cast_types",
+                vec![f32_input("x", &[2, 3])],
+                vec![f16_output("z", &[2, 3])],
+                vec![
+                    node("Cast", "c16", &["x"], &["y"], &[attr_int("to", 10)]),
+                    node("Abs", "abs", &["y"], &["z"], &[]),
+                ],
+                vec![],
+            ),
+        );
+        let res = infer_static_shapes(&m, &HashMap::new()).unwrap();
+        assert_eq!(res.value_types.get("y"), Some(&DataType::Float16));
+        // Downstream unary ops inherit the cast type.
+        assert_eq!(res.value_types.get("z"), Some(&DataType::Float16));
+    }
+
+    #[test]
+    fn unnamed_zero_dims_are_overridable() {
+        use crate::onnx::test_models::prelude::*;
+        let m = model(
+            17,
+            graph(
+                "zero_dims",
+                vec![tensor_input(
+                    "x",
+                    TensorProto_DataType::Float as i32,
+                    &[0, 4],
+                )],
+                vec![f32_output("y", &[0, 4])],
+                vec![node("Abs", "abs", &["x"], &["y"], &[])],
+                vec![],
+            ),
+        );
+        let err = infer_static_shapes(&m, &HashMap::new()).unwrap_err();
+        assert!(matches!(err, ShapeInferenceError::DynamicDim { dim, .. } if dim == "x_dim0"));
+        let overrides = HashMap::from([("x_dim0".to_string(), 3u32)]);
+        let res = infer_static_shapes(&m, &overrides).unwrap();
+        assert_eq!(res.value_shapes.get("y"), Some(&vec![3, 4]));
+    }
+
+    #[test]
+    fn comparison_outputs_are_bool() {
+        use crate::onnx::test_models::prelude::*;
+        let m = model(
+            17,
+            graph(
+                "cmp",
+                vec![f32_input("a", &[2]), f32_input("b", &[2])],
+                vec![bool_output("eq", &[2])],
+                vec![
+                    node("Equal", "eq_node", &["a", "b"], &["eq"], &[]),
+                    node("Less", "lt_node", &["a", "b"], &["lt"], &[]),
+                ],
+                vec![],
+            ),
+        );
+        let res = infer_static_shapes(&m, &HashMap::new()).unwrap();
+        assert_eq!(res.value_types.get("eq"), Some(&DataType::Uint8));
+        assert_eq!(res.value_types.get("lt"), Some(&DataType::Uint8));
+    }
+
+    #[test]
+    fn neg_folds_shape_constants() {
+        let graph = GraphProto {
+            node: vec![
+                shape_node_named("Shape", &["input"], "s"),
+                shape_node_named("Gather", &["s", "idx"], "g"),
+                shape_node_named("Neg", &["g"], "n"),
+            ],
+            ..Default::default()
+        };
+        let mut value_shapes = HashMap::from([("input".to_string(), vec![2, 3])]);
+        let mut value_types = HashMap::new();
+        let mut const_values = HashMap::from([("idx".to_string(), vec![1])]);
+        let mut value_shape_dims = HashMap::new();
+        propagate_shapes_and_fold_constants(
+            &graph,
+            &HashMap::new(),
+            &mut value_shapes,
+            &mut value_types,
+            &mut const_values,
+            &mut value_shape_dims,
+            &PropagateOptions {
+                optimize: true,
+                experimental_dynamic_inputs: false,
+            },
+        );
+        assert_eq!(const_values.get("n"), Some(&vec![-3]));
+    }
+
+    fn shape_node_named(op_type: &str, inputs: &[&str], output: &str) -> NodeProto {
+        let mut node = shape_node(op_type, inputs);
+        node.output = vec![output.to_string()];
+        node
+    }
+
+    #[test]
     fn range_shape_rejects_zero_delta() {
         let node = shape_node("Range", &["start", "limit", "delta"]);
 
@@ -3586,7 +4830,7 @@ mod tests {
     fn matmul_nbits_replaces_last_dim_with_n() {
         let node = NodeProto {
             op_type: "MatMulNBits".to_string(),
-            input: vec!["a".to_string(), "b".to_string(), "scales".to_string()],
+            input: vec!["input".to_string(), "b".to_string(), "scales".to_string()],
             output: vec!["y".to_string()],
             attribute: vec![crate::protos::onnx::AttributeProto {
                 name: "N".to_string(),

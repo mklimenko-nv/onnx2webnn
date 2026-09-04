@@ -20,9 +20,9 @@
 
 use crate::onnx::builder::{map_op_error, OnnxBuilder};
 use crate::onnx::builder_helpers::{
-    ast_dims_to_mldim, expand_with_shape, merge_dims_with_i64_values,
+    ast_dims_to_mldim, expand_with_shape, i64_slice_to_mldim, merge_dims_with_i64_values,
     merge_dims_with_static_values, output_label, record_node_output, reshape_with_shape,
-    u32_slice_to_mldim,
+    slice_with_params, u32_slice_to_mldim,
 };
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
 use crate::onnx::ops::{
@@ -45,6 +45,8 @@ impl OpHandler for ReshapeHandler {
                 | "Transpose"
                 | "Concat"
                 | "Split"
+                | "SplitToSequence"
+                | "SequenceAt"
                 | "Unsqueeze"
                 | "Squeeze"
                 | "Tile"
@@ -71,6 +73,8 @@ impl OpHandler for ReshapeHandler {
             "Transpose" => self.convert_transpose(node, &node_name, context, b),
             "Concat" => self.convert_concat(node, &node_name, context, b),
             "Split" => self.convert_split(node, &node_name, context, b),
+            "SplitToSequence" => self.convert_split_to_sequence(node, &node_name, context, b),
+            "SequenceAt" => self.convert_sequence_at(node, &node_name, context, b),
             "Unsqueeze" => self.convert_unsqueeze(node, &node_name, context, b),
             "Squeeze" => self.convert_squeeze(node, &node_name, context, b),
             "Tile" => self.convert_tile(node, &node_name, context, b),
@@ -382,6 +386,32 @@ impl ReshapeHandler {
                 .cloned()
         };
 
+        // ONNX Reshape: a 0 in the target copies the corresponding input
+        // dimension (unless allowzero=1, where it is a literal zero).
+        let allowzero = node
+            .attribute
+            .as_slice()
+            .iter()
+            .any(|a| a.name.as_str() == "allowzero" && a.i != 0);
+        let shape_values: Vec<i64> = if !allowzero && shape_values.contains(&0) {
+            match input_shape_opt.as_ref() {
+                Some(input_shape) => shape_values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &d)| {
+                        if d == 0 {
+                            input_shape.get(i).copied().unwrap_or(0)
+                        } else {
+                            d
+                        }
+                    })
+                    .collect(),
+                None => shape_values,
+            }
+        } else {
+            shape_values
+        };
+
         let shape_values: Vec<u32> = if shape_values.contains(&-1) {
             // Prefer strict inference when we know the input shape; otherwise fall back to
             // best-effort by replacing -1 with 1 so conversion can proceed for fixed-step
@@ -646,7 +676,7 @@ impl ReshapeHandler {
         };
 
         if shape_values.iter().all(|&v| v == 1) {
-            // All-ones placeholders from Where(ConstantOfShape, …) are not reliable target shapes.
+            // All-ones placeholders from Where(ConstantOfShape, ...) are not reliable target shapes.
             shape_values.clear();
         }
 
@@ -731,6 +761,57 @@ impl ReshapeHandler {
                     dynamic_new_shape = Some(ast_dims_to_mldim(dims));
                 }
             }
+        }
+
+        // ONNX Expand broadcasts bidirectionally: a target dim of 1 keeps the
+        // (larger) input dim. WebNN expand wants the literal output shape, so
+        // fold the input shape into the target before emitting.
+        let shape_values: Vec<i64> = match context.resolve_shape(&data_input_raw) {
+            Some(input_shape) if !shape_values.is_empty() && input_shape.iter().all(|&d| d > 0) => {
+                let rank = input_shape.len().max(shape_values.len());
+                let mut broadcast = Vec::with_capacity(rank);
+                let mut compatible = true;
+                for i in 0..rank {
+                    let in_dim = if i + input_shape.len() >= rank {
+                        input_shape[i + input_shape.len() - rank]
+                    } else {
+                        1
+                    };
+                    let tgt_dim = if i + shape_values.len() >= rank {
+                        shape_values[i + shape_values.len() - rank]
+                    } else {
+                        1
+                    };
+                    // torch exports use -1 for "keep the input dimension".
+                    let tgt_dim = if tgt_dim == -1 { in_dim } else { tgt_dim };
+                    if in_dim != tgt_dim && in_dim != 1 && tgt_dim != 1 {
+                        compatible = false;
+                        break;
+                    }
+                    broadcast.push(in_dim.max(tgt_dim));
+                }
+                if compatible {
+                    broadcast
+                } else {
+                    // Leave incompatible targets untouched; the reshape
+                    // fallback below handles them.
+                    shape_values
+                }
+            }
+            _ => shape_values,
+        };
+
+        // An empty target shape (ONNX: broadcast against a rank-0 shape) is a
+        // no-op; alias the input instead of emitting an expand.
+        if dynamic_new_shape.is_none() && shape_values.is_empty() {
+            let input = b.resolve_operand(&data_input_raw)?;
+            let output_name = output_label(node, node_name);
+            if let Some(onnx_out) = node.output.first() {
+                record_node_output(b, onnx_out, &output_name, input);
+            } else {
+                b.record_operand(&[&output_name], input);
+            }
+            return Ok(ConversionResult::default());
         }
 
         let shape_u32: Vec<u32> = shape_values.iter().map(|&v| v as u32).collect();
@@ -870,11 +951,54 @@ impl ReshapeHandler {
         }
 
         let output_name = output_label(node, node_name);
-        let operands: Result<Vec<_>, _> = inputs.iter().map(|s| b.resolve_operand(s)).collect();
-        let axis = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
-            normalize_axis_best_effort(axis, rank)
-        } else {
-            axis
+        // Zero-size operands (e.g. an empty Slice) contribute nothing to a
+        // concatenation and cannot be represented in WebNN - drop them.
+        let non_empty: Vec<&String> = inputs
+            .iter()
+            .filter(|name| !b.is_empty_optional(name))
+            .collect();
+        if non_empty.is_empty() {
+            return Err(OnnxError::InvalidShape(format!(
+                "Concat '{output_name}' has only zero-size inputs"
+            )));
+        }
+        if non_empty.len() == 1 {
+            let out = b.resolve_operand(non_empty[0])?;
+            return Self::record_output(b, node, &output_name, out, context, None);
+        }
+        // Folded single-value constants are sometimes materialized as rank-0
+        // scalars while their siblings in a shape-vector concat are rank-1;
+        // promote them to [1] (ONNX Concat requires equal ranks anyway).
+        let operands: Result<Vec<_>, _> = non_empty
+            .iter()
+            .map(|s| {
+                let op = b.resolve_operand(s)?;
+                if context
+                    .resolve_shape(s)
+                    .is_some_and(|shape| shape.is_empty())
+                {
+                    reshape_with_shape(
+                        b,
+                        op,
+                        &format!("{output_name}__{}_vec", sanitize_identifier(s)),
+                        i64_slice_to_mldim(&[1])?,
+                    )
+                } else {
+                    Ok(op)
+                }
+            })
+            .collect();
+        let rank = non_empty
+            .iter()
+            .find_map(|name| context.input_rank(name.as_str()));
+        let axis = match rank {
+            Some(rank) => normalize_axis_best_effort(axis, rank),
+            None if axis < 0 => {
+                return Err(OnnxError::InvalidShape(format!(
+                    "Concat '{output_name}' has negative axis {axis} but no input rank is known"
+                )));
+            }
+            None => axis,
         };
         let out = b
             .builder
@@ -915,6 +1039,23 @@ impl ReshapeHandler {
                     splits = Some(attr.ints.clone());
                 }
                 _ => {}
+            }
+        }
+
+        // Opset 13+: split sizes come from the optional second input.
+        if splits.is_none() {
+            if let Some(name) = inputs.get(1).filter(|n| !n.is_empty()) {
+                splits = context
+                    .const_values
+                    .get(name.as_str())
+                    .cloned()
+                    .or_else(|| {
+                        context
+                            .initializers
+                            .get(name.as_str())
+                            .map(|t| crate::onnx::shape_inference::read_int_tensor(t))
+                    })
+                    .filter(|v| !v.is_empty());
             }
         }
 
@@ -1088,6 +1229,33 @@ impl ReshapeHandler {
             axes_values
         };
 
+        // Prefer an explicit reshape when the static shape is known: rustnn's
+        // ONNX exporter currently drops the axes input on Squeeze, making ORT
+        // squeeze every unit dim (e.g. batch=1) instead of only the requested
+        // ones. A reshape encodes the exact output shape and sidesteps that.
+        if let Some(input_shape) = context.resolve_shape(inputs[0].as_str()) {
+            if !axes_values.is_empty()
+                && input_shape.iter().all(|&d| d > 0)
+                && axes_values
+                    .iter()
+                    .all(|&a| input_shape.get(a as usize) == Some(&1))
+            {
+                let squeezed: Vec<i64> = input_shape
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !axes_values.contains(&(*i as i64)))
+                    .map(|(_, &d)| d)
+                    .collect();
+                let out = reshape_with_shape(
+                    b,
+                    input0,
+                    &output_name,
+                    crate::onnx::builder_helpers::i64_slice_to_mldim(&squeezed)?,
+                )?;
+                return Self::record_output(b, node, &output_name, out, context, None);
+            }
+        }
+
         let opts = MLSqueezeOptions {
             label: output_name.clone(),
             axes: axes_values.into_iter().map(|a| a as u32).collect(),
@@ -1097,6 +1265,183 @@ impl ReshapeHandler {
             .squeeze_with_options(input0, opts)
             .map_err(map_op_error)?;
         Self::record_output(b, node, &output_name, out, context, None)
+    }
+
+    /// Lower `SplitToSequence` with constant split sizes by emitting one WebNN
+    /// slice per element, registered as `{output}__seq{i}`. `SequenceAt` with
+    /// a constant index then aliases the selected element, so the torch
+    /// `split()` export pattern converts without sequence support in WebNN.
+    fn convert_split_to_sequence(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+        b: &mut OnnxBuilder<'_, '_, '_>,
+    ) -> Result<ConversionResult, OnnxError> {
+        let inputs = node.input.as_slice();
+        if inputs.is_empty() {
+            return Err(OnnxError::InvalidShape(
+                "SplitToSequence expects at least 1 input".to_string(),
+            ));
+        }
+        let mut axis = 0i64;
+        let mut keepdims = 1i64;
+        for attr in node.attribute.as_slice() {
+            match attr.name.as_str() {
+                "axis" => axis = attr.i,
+                "keepdims" => keepdims = attr.i,
+                _ => {}
+            }
+        }
+
+        let input_shape = context
+            .resolve_shape(inputs[0].as_str())
+            .cloned()
+            .ok_or_else(|| {
+                OnnxError::InvalidShape(format!(
+                    "SplitToSequence '{node_name}' requires a static shape for '{}'",
+                    inputs[0]
+                ))
+            })?;
+        let rank = input_shape.len();
+        let axis = normalize_axis_best_effort(axis, rank) as usize;
+        if axis >= rank {
+            return Err(OnnxError::InvalidShape(format!(
+                "SplitToSequence '{node_name}' axis {axis} out of bounds for rank {rank}"
+            )));
+        }
+        let dim = input_shape[axis];
+
+        // Constant split sizes (1-D) or scalar chunk length; absent means
+        // per-element splitting (which requires keepdims=0 semantics we skip).
+        let split_name = inputs.get(1).filter(|n| !n.is_empty());
+        let sizes: Vec<i64> = match split_name {
+            Some(name) => {
+                let values = context
+                    .const_values
+                    .get(name.as_str())
+                    .cloned()
+                    .or_else(|| {
+                        context
+                            .initializers
+                            .get(name.as_str())
+                            .map(|t| crate::onnx::shape_inference::read_int_tensor(t))
+                    })
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        OnnxError::unsupported_op(
+                            "SplitToSequence(non-constant split)",
+                            node_name.to_string(),
+                        )
+                    })?;
+                let is_scalar = context
+                    .resolve_shape(name.as_str())
+                    .map(|s| s.is_empty())
+                    .unwrap_or(values.len() == 1);
+                if is_scalar && values.len() == 1 {
+                    // Scalar chunk length: dim split into ceil(dim/len) chunks.
+                    let chunk = values[0].max(1);
+                    let mut sizes = vec![chunk; (dim / chunk) as usize];
+                    if dim % chunk != 0 {
+                        sizes.push(dim % chunk);
+                    }
+                    sizes
+                } else {
+                    values
+                }
+            }
+            None => {
+                if keepdims == 0 {
+                    return Err(OnnxError::unsupported_op(
+                        "SplitToSequence(keepdims=0)",
+                        node_name.to_string(),
+                    ));
+                }
+                vec![1; dim as usize]
+            }
+        };
+        if sizes.iter().sum::<i64>() != dim || sizes.iter().any(|&s| s <= 0) {
+            return Err(OnnxError::InvalidShape(format!(
+                "SplitToSequence '{node_name}' sizes {sizes:?} do not partition dim {dim}"
+            )));
+        }
+
+        let seq_name = node.output.first().cloned().unwrap_or_default();
+        let input = b.resolve_operand(&inputs[0])?;
+        let mut start = 0i64;
+        for (i, &size) in sizes.iter().enumerate() {
+            let mut starts = vec![0u32; rank];
+            starts[axis] = start as u32;
+            let mut chunk_shape = input_shape.clone();
+            chunk_shape[axis] = size;
+            let elem_name = OnnxBuilder::sequence_element_key(&seq_name, i);
+            let out = slice_with_params(
+                b,
+                input,
+                &elem_name,
+                &starts,
+                &i64_slice_to_mldim(&chunk_shape)?,
+            )?;
+            b.record_operand(&[&elem_name], out);
+            start += size;
+        }
+        b.record_sequence(&seq_name, sizes.len());
+        Ok(ConversionResult::default())
+    }
+
+    /// Alias a `SequenceAt(sequence, const index)` to the pre-registered
+    /// sequence element operand.
+    fn convert_sequence_at(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+        b: &mut OnnxBuilder<'_, '_, '_>,
+    ) -> Result<ConversionResult, OnnxError> {
+        let inputs = node.input.as_slice();
+        if inputs.len() < 2 {
+            return Err(OnnxError::InvalidShape(format!(
+                "SequenceAt expects 2 inputs, got {}",
+                inputs.len()
+            )));
+        }
+        let count = b.sequence_element_count(&inputs[0]).ok_or_else(|| {
+            OnnxError::unsupported_op(
+                "SequenceAt(sequence not produced by a supported SplitToSequence)",
+                node_name.to_string(),
+            )
+        })?;
+        let index = context
+            .const_values
+            .get(inputs[1].as_str())
+            .and_then(|v| v.first().copied())
+            .or_else(|| {
+                context.initializers.get(inputs[1].as_str()).and_then(|t| {
+                    crate::onnx::shape_inference::read_int_tensor(t)
+                        .first()
+                        .copied()
+                })
+            })
+            .ok_or_else(|| {
+                OnnxError::unsupported_op("SequenceAt(non-constant index)", node_name.to_string())
+            })?;
+        let index = if index < 0 {
+            index + count as i64
+        } else {
+            index
+        };
+        if index < 0 || index as usize >= count {
+            return Err(OnnxError::InvalidShape(format!(
+                "SequenceAt '{node_name}' index {index} out of bounds for {count} elements"
+            )));
+        }
+        let elem_name = OnnxBuilder::sequence_element_key(&inputs[0], index as usize);
+        let out = b.resolve_operand(&elem_name)?;
+        let output_name = output_label(node, node_name);
+        if let Some(onnx_out) = node.output.first() {
+            record_node_output(b, onnx_out, &output_name, out);
+        }
+        Ok(ConversionResult::default())
     }
 
     /// Convert ONNX Tile to WebNN tile

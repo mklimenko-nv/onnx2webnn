@@ -835,7 +835,28 @@ def _build_qlinear_conv(opset: int) -> ModelProto:
 
 
 def _build_qlinear_matmul(opset: int) -> ModelProto:
-    return _build_matmul_integer(opset)
+    a = numpy_helper.from_array(np.array([[1, 2]], dtype=np.uint8), "a")
+    a_scale = numpy_helper.from_array(np.array(0.5, dtype=np.float32), "a_scale")
+    a_zp = numpy_helper.from_array(np.array(0, dtype=np.uint8), "a_zero_point")
+    b = numpy_helper.from_array(np.array([[3], [4]], dtype=np.uint8), "b")
+    b_scale = numpy_helper.from_array(np.array(0.25, dtype=np.float32), "b_scale")
+    b_zp = numpy_helper.from_array(np.array(0, dtype=np.uint8), "b_zero_point")
+    y_scale = numpy_helper.from_array(np.array(0.125, dtype=np.float32), "y_scale")
+    y_zp = numpy_helper.from_array(np.array(0, dtype=np.uint8), "y_zero_point")
+    node = helper.make_node(
+        "QLinearMatMul",
+        ["a", "a_scale", "a_zero_point", "b", "b_scale", "b_zero_point", "y_scale", "y_zero_point"],
+        ["y"],
+        name="test",
+    )
+    graph = helper.make_graph(
+        [node],
+        "test_QLinearMatMul_graph",
+        [],
+        [_u8("y", [1, 1])],
+        [a, a_scale, a_zp, b, b_scale, b_zp, y_scale, y_zp],
+    )
+    return _model(graph, opset)
 
 
 def _build_softmax_cross_entropy(opset: int) -> ModelProto:

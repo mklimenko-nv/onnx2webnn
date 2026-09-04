@@ -24,24 +24,41 @@ use crate::onnx::builder_helpers::{
     slice_sizes_from_i64, slice_with_params,
 };
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
+use crate::onnx::ops::conv::lookup_shape;
 use crate::onnx::ops::{
     normalize_axis_best_effort, ConversionContext, ConversionResult, OpHandler,
 };
 use crate::protos::onnx::NodeProto;
 use half::f16;
+use rustnn::mlcontext::MLOperand;
 use rustnn::operator_options::{
-    MLDimension, MLDynamicDimension, MLGatherOptions, MLReverseOptions, MLTriangularOptions,
+    MLDimension, MLDynamicDimension, MLGatherOptions, MLReverseOptions, MLSliceOptions,
+    MLTriangularOptions,
 };
 use rustnn::DataType;
 
 pub struct UtilityHandler;
+
+/// Constant inputs of a GatherBlockQuantized node in the packed-row lowering.
+struct GbqTable<'a> {
+    data: &'a crate::protos::onnx::TensorProto,
+    scales: &'a crate::protos::onnx::TensorProto,
+    zero_points: Option<&'a crate::protos::onnx::TensorProto>,
+    bits: i64,
+    signed: bool,
+    cols: i64,
+    packed_cols: i64,
+    blocks: i64,
+}
 
 impl OpHandler for UtilityHandler {
     fn supports(&self, op_type: &str) -> bool {
         matches!(
             op_type,
             "Shape"
+                | "OneHot"
                 | "Gather"
+                | "GatherBlockQuantized"
                 | "GatherND"
                 | "GatherElements"
                 | "ReverseSequence"
@@ -66,8 +83,12 @@ impl OpHandler for UtilityHandler {
         };
 
         match op_type {
-            "Shape" => self.convert_shape(node, &node_name, b),
+            "Shape" => self.convert_shape(node, &node_name, context, b),
+            "OneHot" => self.convert_one_hot(node, &node_name, context, b),
             "Gather" => self.convert_gather(node, &node_name, context, b),
+            "GatherBlockQuantized" => {
+                self.convert_gather_block_quantized(node, &node_name, context, b)
+            }
             "GatherND" => self.convert_gather_nd(node, &node_name, context, b),
             "GatherElements" => self.convert_gather_elements(node, &node_name, context, b),
             "ReverseSequence" => self.convert_reverse_sequence(node, &node_name, context, b),
@@ -87,6 +108,7 @@ impl UtilityHandler {
         &self,
         node: &NodeProto,
         node_name: &str,
+        context: &ConversionContext,
         b: &mut OnnxBuilder<'_, '_, '_>,
     ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.input.as_slice();
@@ -100,18 +122,232 @@ impl UtilityHandler {
         let output_name = output_label(node, node_name);
         let input = b.resolve_operand(&inputs[0])?;
         let opts = OnnxBuilder::labeled_options(&output_name);
-        let out = b
+        let mut out = b
             .builder
             .shape_with_options(input, opts)
             .map_err(map_op_error)?;
+        // Dynamo exports use Shape start/end attributes to slice the shape
+        // vector (e.g. Shape(x, start=0, end=1) for just the batch dim).
+        if let Some(rank) = lookup_shape(&inputs[0], context).map(|s| s.len()) {
+            let (start, end) = crate::onnx::shape_inference::shape_attr_range(node, rank);
+            if start != 0 || end != rank {
+                out = b
+                    .builder
+                    .slice_with_options(
+                        out,
+                        &[start as u32],
+                        &[MLDimension::Static((end - start) as u32)],
+                        MLSliceOptions {
+                            label: format!("{output_name}_range"),
+                            strides: Vec::new(),
+                        },
+                    )
+                    .map_err(map_op_error)?;
+            }
+        } else if node
+            .attribute
+            .as_slice()
+            .iter()
+            .any(|a| matches!(a.name.as_str(), "start" | "end"))
+        {
+            return Err(OnnxError::InvalidShape(format!(
+                "Shape node {node_name} has start/end attributes but input rank is unknown"
+            )));
+        }
         if let Some(output) = node.output.as_slice().first() {
             record_node_output(b, output, &output_name, out);
         }
         Ok(ConversionResult::default())
     }
 
+    /// OneHot(indices, depth, values) -> where(indices == range(depth), on, off).
+    /// `depth` and `values` must be constants; negative indices wrap like ONNX.
+    fn convert_one_hot(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+        b: &mut OnnxBuilder<'_, '_, '_>,
+    ) -> Result<ConversionResult, OnnxError> {
+        use crate::onnx::builder_helpers::{i64_slice_to_mldim, reshape_with_shape};
+
+        let inputs = node.input.as_slice();
+        if inputs.len() != 3 {
+            return Err(OnnxError::InvalidShape(format!(
+                "OneHot expects 3 inputs, got {}",
+                inputs.len()
+            )));
+        }
+        let indices_shape = lookup_shape(&inputs[0], context).ok_or_else(|| {
+            OnnxError::InvalidShape(format!(
+                "OneHot {node_name} requires a static indices shape"
+            ))
+        })?;
+        let depth = context
+            .const_values
+            .get(inputs[1].as_str())
+            .and_then(|v| v.first().copied())
+            .or_else(|| {
+                context.initializers.get(inputs[1].as_str()).and_then(|t| {
+                    crate::onnx::shape_inference::read_int_tensor(t)
+                        .first()
+                        .copied()
+                })
+            })
+            .filter(|&d| d > 0)
+            .ok_or_else(|| {
+                OnnxError::unsupported_op("OneHot(non-constant depth)", node_name.to_string())
+            })?;
+        let values = context
+            .initializers
+            .get(inputs[2].as_str())
+            .copied()
+            .ok_or_else(|| {
+                OnnxError::unsupported_op("OneHot(non-constant values)", node_name.to_string())
+            })?;
+        let value_dtype = crate::onnx::convert::map_onnx_data_type(values.data_type)?;
+        let value_bytes = crate::onnx::builder::tensor_proto_to_bytes(values)?;
+        let elem = value_dtype.bits_per_element() / 8;
+        if value_bytes.len() < 2 * elem {
+            return Err(OnnxError::InvalidShape(format!(
+                "OneHot {node_name} values must hold [off, on]"
+            )));
+        }
+        let index_dtype = context
+            .value_types
+            .get(inputs[0].as_str())
+            .copied()
+            .or_else(|| {
+                context
+                    .initializers
+                    .get(inputs[0].as_str())
+                    .and_then(|t| crate::onnx::convert::map_onnx_data_type(t.data_type).ok())
+            })
+            .unwrap_or(DataType::Int64);
+        let index_bytes = |v: i64| -> Result<Vec<u8>, OnnxError> {
+            match index_dtype {
+                DataType::Int64 => Ok(v.to_le_bytes().to_vec()),
+                DataType::Int32 => Ok((v as i32).to_le_bytes().to_vec()),
+                other => Err(OnnxError::unsupported_op(
+                    format!("OneHot(indices {other:?})"),
+                    node_name.to_string(),
+                )),
+            }
+        };
+
+        let out_rank = indices_shape.len() as i64 + 1;
+        let mut axis = node
+            .attribute
+            .as_slice()
+            .iter()
+            .find(|a| a.name.as_str() == "axis")
+            .map(|a| a.i)
+            .unwrap_or(-1);
+        if axis < 0 {
+            axis += out_rank;
+        }
+        if axis < 0 || axis >= out_rank {
+            return Err(OnnxError::InvalidShape(format!(
+                "OneHot {node_name} axis out of range"
+            )));
+        }
+        let axis = axis as usize;
+        let mut out_shape = indices_shape.clone();
+        out_shape.insert(axis, depth);
+        let mut unsqueezed = indices_shape.clone();
+        unsqueezed.insert(axis, 1);
+        let mut range_shape = vec![1i64; out_rank as usize];
+        range_shape[axis] = depth;
+
+        let label = output_label(node, node_name);
+        let indices = b.resolve_operand(&inputs[0])?;
+        let indices = reshape_with_shape(
+            b,
+            indices,
+            &format!("{label}__idx"),
+            i64_slice_to_mldim(&unsqueezed)?,
+        )?;
+
+        // Negative indices count from the end: idx < 0 ? idx + depth : idx.
+        let zero_name = format!("{label}__zero");
+        b.register_constant_from_bytes(&zero_name, index_dtype, &[1], index_bytes(0)?)?;
+        let depth_name = format!("{label}__depth");
+        b.register_constant_from_bytes(&depth_name, index_dtype, &[1], index_bytes(depth)?)?;
+        let zero = b.resolve_operand(&zero_name)?;
+        let depth_op = b.resolve_operand(&depth_name)?;
+        let negative = b
+            .builder
+            .lesser_with_options(
+                indices,
+                zero,
+                OnnxBuilder::labeled_options(&format!("{label}__neg")),
+            )
+            .map_err(map_op_error)?;
+        let wrapped = b
+            .builder
+            .add_with_options(
+                indices,
+                depth_op,
+                OnnxBuilder::labeled_options(&format!("{label}__wrap")),
+            )
+            .map_err(map_op_error)?;
+        let indices = b
+            .builder
+            .where_with_options(
+                negative,
+                wrapped,
+                indices,
+                OnnxBuilder::labeled_options(&format!("{label}__fixed")),
+            )
+            .map_err(map_op_error)?;
+
+        let range_name = format!("{label}__range");
+        let range_bytes: Vec<u8> = (0..depth)
+            .map(index_bytes)
+            .collect::<Result<Vec<_>, _>>()?
+            .concat();
+        let range_dims: Vec<u32> = range_shape.iter().map(|&d| d as u32).collect();
+        b.register_constant_from_bytes(&range_name, index_dtype, &range_dims, range_bytes)?;
+        let range = b.resolve_operand(&range_name)?;
+        let hit = b
+            .builder
+            .equal_with_options(
+                indices,
+                range,
+                OnnxBuilder::labeled_options(&format!("{label}__hit")),
+            )
+            .map_err(map_op_error)?;
+
+        let off_name = format!("{label}__off");
+        let on_name = format!("{label}__on");
+        b.register_constant_from_bytes(&off_name, value_dtype, &[1], value_bytes[..elem].to_vec())?;
+        b.register_constant_from_bytes(
+            &on_name,
+            value_dtype,
+            &[1],
+            value_bytes[elem..2 * elem].to_vec(),
+        )?;
+        let off = b.resolve_operand(&off_name)?;
+        let on = b.resolve_operand(&on_name)?;
+        let out = b
+            .builder
+            .where_with_options(hit, on, off, OnnxBuilder::labeled_options(&label))
+            .map_err(map_op_error)?;
+        if let Some(output) = node.output.as_slice().first() {
+            record_node_output(b, output, &label, out);
+        }
+        let mut result = ConversionResult::default();
+        if let Some(output) = node.output.as_slice().first() {
+            result.output_types.insert(output.to_string(), value_dtype);
+        }
+        Ok(result)
+    }
+
     fn read_scalar_f64(&self, name: &str, context: &ConversionContext) -> Option<f64> {
         use crate::protos::onnx::TensorProto_DataType;
+        if let Some(v) = context.const_values.get(name).and_then(|v| v.first()) {
+            return Some(*v as f64);
+        }
         if let Some(t) = context.initializers.get(name) {
             if t.data_type == TensorProto_DataType::Float as i32 {
                 if !t.float_data.is_empty() {
@@ -231,7 +467,7 @@ impl UtilityHandler {
         };
 
         // Float ranges materialize a constant. The dynamic (symbolic-dim) path below is
-        // integer-only — it exists to express runtime shape dimensions, which are always integral.
+        // integer-only - it exists to express runtime shape dimensions, which are always integral.
         let range_dtype = self.range_element_type(inputs, context);
         if matches!(range_dtype, DataType::Float32 | DataType::Float16) {
             return self.convert_range_static_float(
@@ -301,7 +537,7 @@ impl UtilityHandler {
                 &range_const_name,
                 DataType::Int64,
                 &[values.len() as u32],
-                &bytes,
+                bytes,
             )?;
 
             let range_const = b.resolve_operand(&range_const_name)?;
@@ -381,7 +617,7 @@ impl UtilityHandler {
             &output_name,
             DataType::Int64,
             &[values.len() as u32],
-            &bytes,
+            bytes,
         )?;
         if let Some(out) = node.output.as_slice().first() {
             record_node_output(b, out, &output_name, b.resolve_operand(&output_name)?);
@@ -453,7 +689,7 @@ impl UtilityHandler {
                 .collect(),
             _ => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
         };
-        b.register_constant_from_bytes(output_name, dtype, &[values.len() as u32], &bytes)?;
+        b.register_constant_from_bytes(output_name, dtype, &[values.len() as u32], bytes)?;
         if let Some(out) = node.output.as_slice().first() {
             record_node_output(b, out, output_name, b.resolve_operand(output_name)?);
         }
@@ -529,6 +765,244 @@ impl UtilityHandler {
         Ok(result)
     }
 
+    /// GatherBlockQuantized over a 2-D table along axis 0: gather the packed
+    /// rows plus their scales and zero points, unpack nibbles, and dequantize
+    /// only the gathered slice.
+    #[allow(clippy::too_many_lines)]
+    fn convert_gather_block_quantized_packed(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+        b: &mut OnnxBuilder<'_, '_, '_>,
+        t: GbqTable<'_>,
+    ) -> Result<ConversionResult, OnnxError> {
+        use crate::onnx::builder::{map_ast_data_type, tensor_proto_to_bytes};
+        use crate::onnx::builder_helpers::{i64_slice_to_mldim, reshape_with_shape};
+
+        let inputs = node.input.as_slice();
+        let output_name = output_label(node, node_name);
+        let rows = t.data.dims[0];
+        let rows_u = rows as usize;
+        let blocks_u = t.blocks as usize;
+        let indices_shape = lookup_shape(&inputs[1], context).ok_or_else(|| {
+            OnnxError::InvalidShape(format!(
+                "GatherBlockQuantized {node_name} requires a static indices shape"
+            ))
+        })?;
+        let value_dtype = if t.signed {
+            DataType::Int8
+        } else {
+            DataType::Uint8
+        };
+
+        // Packed table: [rows, packed_cols] uint8 for 4-bit, [rows, cols] for 8-bit.
+        let mut table_bytes = tensor_proto_to_bytes(t.data)?;
+        let table_len = rows_u * t.packed_cols as usize;
+        if table_bytes.len() < table_len {
+            return Err(OnnxError::InvalidShape(format!(
+                "GatherBlockQuantized table holds {} bytes, need {table_len}",
+                table_bytes.len()
+            )));
+        }
+        let table_name = format!("{output_name}__table");
+        table_bytes.truncate(table_len);
+        b.register_constant_from_bytes(
+            &table_name,
+            DataType::Uint8,
+            &[rows as u32, t.packed_cols as u32],
+            table_bytes,
+        )?;
+
+        let scales_dtype = crate::onnx::convert::map_onnx_data_type(t.scales.data_type)?;
+        let mut scales_bytes = tensor_proto_to_bytes(t.scales)?;
+        let scales_len = rows_u * blocks_u * (scales_dtype.bits_per_element() / 8);
+        if scales_bytes.len() < scales_len {
+            return Err(OnnxError::InvalidShape(format!(
+                "GatherBlockQuantized scales hold {} bytes, need {scales_len}",
+                scales_bytes.len()
+            )));
+        }
+        let scales_name = format!("{output_name}__scales");
+        scales_bytes.truncate(scales_len);
+        b.register_constant_from_bytes(
+            &scales_name,
+            scales_dtype,
+            &[rows as u32, t.blocks as u32],
+            scales_bytes,
+        )?;
+
+        // One byte per zero point; defaults: 8 (uint4), 128 (uint8), 0 (signed).
+        let default_zp: u8 = if t.signed { 0 } else { 1u8 << (t.bits - 1) };
+        let zp_values: Vec<u8> = match t.zero_points {
+            None => vec![default_zp; rows_u * blocks_u],
+            Some(zp) => {
+                let bytes = tensor_proto_to_bytes(zp)?;
+                let flat_nibbles = zp.data_type == 21 || zp.data_type == 22;
+                let per_row_packed = ((t.blocks + 1) / 2) as usize;
+                (0..rows_u * blocks_u)
+                    .map(|idx| {
+                        let (row, block) = (idx / blocks_u, idx % blocks_u);
+                        let raw = if t.bits == 8 {
+                            bytes.get(idx).copied().unwrap_or(default_zp)
+                        } else {
+                            let (byte_idx, high) = if flat_nibbles {
+                                (idx / 2, idx % 2 == 1)
+                            } else {
+                                (row * per_row_packed + block / 2, block % 2 == 1)
+                            };
+                            let byte = bytes.get(byte_idx).copied().unwrap_or(0x88);
+                            if high {
+                                byte >> 4
+                            } else {
+                                byte & 0x0F
+                            }
+                        };
+                        if t.signed && t.bits == 4 && raw >= 8 {
+                            (raw as i8 - 16) as u8
+                        } else {
+                            raw
+                        }
+                    })
+                    .collect()
+            }
+        };
+        let zp_name = format!("{output_name}__zp");
+        b.register_constant_from_bytes(
+            &zp_name,
+            value_dtype,
+            &[rows as u32, t.blocks as u32],
+            zp_values,
+        )?;
+
+        let indices = b.resolve_operand(&inputs[1])?;
+        let gather = |b: &mut OnnxBuilder<'_, '_, '_>,
+                      name: &str,
+                      tag: &str|
+         -> Result<MLOperand, OnnxError> {
+            let table = b.resolve_operand(name)?;
+            b.builder
+                .gather_with_options(
+                    table,
+                    indices,
+                    MLGatherOptions {
+                        label: format!("{output_name}__{tag}"),
+                        axis: 0,
+                    },
+                )
+                .map_err(map_op_error)
+        };
+        let mut q_rows = gather(b, &table_name, "rows")?;
+        let scale_rows = gather(b, &scales_name, "scale_rows")?;
+        let zp_rows = gather(b, &zp_name, "zp_rows")?;
+
+        if t.bits == 4 {
+            // Split bytes into nibbles in int32 and interleave them (low first).
+            let int32 = map_ast_data_type(DataType::Int32)?;
+            let mut x = b
+                .builder
+                .cast_with_options(
+                    q_rows,
+                    int32,
+                    OnnxBuilder::labeled_options(&format!("{output_name}__i32")),
+                )
+                .map_err(map_op_error)?;
+            let const_i32 = |b: &mut OnnxBuilder<'_, '_, '_>,
+                             tag: &str,
+                             v: i32|
+             -> Result<MLOperand, OnnxError> {
+                let name = format!("{output_name}__{tag}");
+                let bytes = v.to_le_bytes().to_vec();
+                b.register_constant_from_bytes(&name, DataType::Int32, &[1], bytes)?;
+                b.resolve_operand(&name)
+            };
+            let c16 = const_i32(b, "c16", 16)?;
+            let binary = |b: &mut OnnxBuilder<'_, '_, '_>,
+                          op: &str,
+                          lhs: MLOperand,
+                          rhs: MLOperand,
+                          tag: &str|
+             -> Result<MLOperand, OnnxError> {
+                let opts = OnnxBuilder::labeled_options(&format!("{output_name}__{tag}"));
+                match op {
+                    "div" => b.builder.div_with_options(lhs, rhs, opts),
+                    "mul" => b.builder.mul_with_options(lhs, rhs, opts),
+                    _ => b.builder.sub_with_options(lhs, rhs, opts),
+                }
+                .map_err(map_op_error)
+            };
+            let hi = binary(b, "div", x, c16, "hi")?;
+            let hi16 = binary(b, "mul", hi, c16, "hi16")?;
+            let lo = binary(b, "sub", x, hi16, "lo")?;
+            let (lo, hi) = if t.signed {
+                // Two's complement nibble: n - 16 * (n >= 8).
+                let c8 = const_i32(b, "c8", 8)?;
+                let signed = |b: &mut OnnxBuilder<'_, '_, '_>,
+                              n: MLOperand,
+                              tag: &str|
+                 -> Result<MLOperand, OnnxError> {
+                    let ge8 = binary(b, "div", n, c8, &format!("{tag}_ge8"))?;
+                    let wrap = binary(b, "mul", ge8, c16, &format!("{tag}_wrap"))?;
+                    binary(b, "sub", n, wrap, &format!("{tag}_signed"))
+                };
+                (signed(b, lo, "lo")?, signed(b, hi, "hi")?)
+            } else {
+                (lo, hi)
+            };
+            let mut split_shape = indices_shape.clone();
+            split_shape.extend([t.packed_cols, 1]);
+            let lo = reshape_with_shape(
+                b,
+                lo,
+                &format!("{output_name}__lo_col"),
+                i64_slice_to_mldim(&split_shape)?,
+            )?;
+            let hi = reshape_with_shape(
+                b,
+                hi,
+                &format!("{output_name}__hi_col"),
+                i64_slice_to_mldim(&split_shape)?,
+            )?;
+            let joined = b
+                .builder
+                .concat_with_options(
+                    &[lo, hi],
+                    (split_shape.len() - 1) as u32,
+                    OnnxBuilder::labeled_options(&format!("{output_name}__interleave")),
+                )
+                .map_err(map_op_error)?;
+            let mut full_shape = indices_shape.clone();
+            full_shape.push(t.cols);
+            x = reshape_with_shape(
+                b,
+                joined,
+                &format!("{output_name}__unpacked"),
+                i64_slice_to_mldim(&full_shape)?,
+            )?;
+            q_rows = b
+                .builder
+                .cast_with_options(
+                    x,
+                    map_ast_data_type(value_dtype)?,
+                    OnnxBuilder::labeled_options(&format!("{output_name}__q")),
+                )
+                .map_err(map_op_error)?;
+        }
+
+        let out = b
+            .builder
+            .dequantize_linear_with_zeropoint(q_rows, scale_rows, zp_rows)
+            .map_err(map_op_error)?;
+        if let Some(output) = node.output.as_slice().first() {
+            record_node_output(b, output, &output_name, out);
+        }
+        let mut result = ConversionResult::default();
+        if let Some(output) = node.output.as_slice().first() {
+            result.output_types.insert(output.to_string(), scales_dtype);
+        }
+        Ok(result)
+    }
+
     /// Convert ConstantOfShape into an inline constant when the output shape is statically known.
     fn convert_constant_of_shape(
         &self,
@@ -582,9 +1056,10 @@ impl UtilityHandler {
             }
         }
 
-        // Determine fill value and data type (default int64 zero)
-        let mut fill_value_i64: i64 = 0;
-        let mut dtype = DataType::Int64;
+        // Determine fill value and data type. ONNX defaults to float32 zero
+        // when the `value` attribute is absent.
+        let mut fill_value_i64: i64 = 0f32.to_bits() as i64;
+        let mut dtype = DataType::Float32;
         for attr in node.attribute.as_slice() {
             if attr.name.as_str() == "value" {
                 if let Some(t) = attr.t.as_ref() {
@@ -650,7 +1125,7 @@ impl UtilityHandler {
                 _ => fill_value_i64.to_le_bytes().to_vec(),
             };
             let scalar_name = format!("{}_fill", output_name);
-            b.register_constant_from_bytes(&scalar_name, dtype, &[1], &scalar_bytes)?;
+            b.register_constant_from_bytes(&scalar_name, dtype, &[1], scalar_bytes)?;
 
             let scalar = b.resolve_operand(&scalar_name)?;
             let out = expand_with_shape(b, scalar, &output_name, ast_dims_to_mldim(dims))?;
@@ -666,11 +1141,21 @@ impl UtilityHandler {
 
         let shape = shape.unwrap_or_else(|| vec![1]);
 
+        if shape.contains(&0) {
+            // Zero-size tensors have no WebNN representation; consumers such
+            // as Concat drop empty optional operands.
+            let output_name = output_label(node, node_name);
+            b.mark_empty_optional(&output_name);
+            if let Some(out) = node.output.as_slice().first() {
+                b.mark_empty_optional(out);
+            }
+            return Ok(ConversionResult::default());
+        }
         let mut numel: usize = 1;
         for d in &shape {
-            if *d <= 0 {
+            if *d < 0 {
                 return Err(OnnxError::InvalidShape(format!(
-                    "ConstantOfShape '{}' has non-positive dimension {:?}",
+                    "ConstantOfShape '{}' has negative dimension {:?}",
                     node_name, shape
                 )));
             }
@@ -697,7 +1182,7 @@ impl UtilityHandler {
             &output_name,
             dtype,
             &shape.iter().map(|d| *d as u32).collect::<Vec<_>>(),
-            &bytes,
+            bytes,
         )?;
         if let Some(out) = node.output.as_slice().first() {
             record_node_output(b, out, &output_name, b.resolve_operand(&output_name)?);
@@ -761,6 +1246,273 @@ impl UtilityHandler {
             }
         }
 
+        Ok(result)
+    }
+
+    /// Lower `com.microsoft.GatherBlockQuantized` by dequantizing the packed
+    /// 4-bit table at conversion time and emitting a plain gather.
+    ///
+    /// Data is uint8 with two values per byte (low nibble first) packed along
+    /// `quantize_axis` (required to be the last axis); dequantization is
+    /// `(q - zero_point) * scale` with blockwise scales and optional packed
+    /// 4-bit zero points (default 8). The dense float table matches the
+    /// unquantized export's memory footprint.
+    fn convert_gather_block_quantized(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+        b: &mut OnnxBuilder<'_, '_, '_>,
+    ) -> Result<ConversionResult, OnnxError> {
+        use crate::protos::onnx::TensorProto_DataType;
+
+        let inputs = node.input.as_slice();
+        if inputs.len() < 3 {
+            return Err(OnnxError::InvalidShape(format!(
+                "GatherBlockQuantized expects at least 3 inputs (data, indices, scales), got {}",
+                inputs.len()
+            )));
+        }
+
+        let mut gather_axis = 0i64;
+        let mut quantize_axis = 1i64;
+        let mut bits = 4i64;
+        let mut block_size = 128i64;
+        for attr in node.attribute.as_slice() {
+            match attr.name.as_str() {
+                "gather_axis" => gather_axis = attr.i,
+                "quantize_axis" => quantize_axis = attr.i,
+                "bits" => bits = attr.i,
+                "block_size" => block_size = attr.i,
+                _ => {}
+            }
+        }
+        if bits != 4 && bits != 8 {
+            return Err(OnnxError::unsupported_op(
+                format!("GatherBlockQuantized(bits={bits})"),
+                node_name.to_string(),
+            ));
+        }
+
+        let data = context
+            .initializers
+            .get(inputs[0].as_str())
+            .copied()
+            .ok_or_else(|| {
+                OnnxError::unsupported_op(
+                    "GatherBlockQuantized(non-constant data)",
+                    node_name.to_string(),
+                )
+            })?;
+        let scales_tensor = context
+            .initializers
+            .get(inputs[2].as_str())
+            .copied()
+            .ok_or_else(|| {
+                OnnxError::unsupported_op(
+                    "GatherBlockQuantized(non-constant scales)",
+                    node_name.to_string(),
+                )
+            })?;
+        // Tables are packed uint8 (`bits` values per byte) or ONNX 1.16+ 4-bit
+        // dtypes (UINT4 = 21, INT4 = 22) whose dims are already logical.
+        let four_bit_dtype = data.data_type == 21 || data.data_type == 22;
+        let signed = data.data_type == 22;
+        if data.data_type != TensorProto_DataType::Uint8 as i32 && !four_bit_dtype {
+            return Err(OnnxError::InvalidShape(format!(
+                "GatherBlockQuantized data must be packed uint8 or INT4/UINT4, got data_type={}",
+                data.data_type
+            )));
+        }
+        let bits = if four_bit_dtype { 4 } else { bits };
+        let per_byte = (8 / bits) as usize;
+        let rank = data.dims.len() as i64;
+        let quantize_axis = if quantize_axis < 0 {
+            quantize_axis + rank
+        } else {
+            quantize_axis
+        };
+        if rank == 0 || quantize_axis != rank - 1 {
+            return Err(OnnxError::unsupported_op(
+                format!("GatherBlockQuantized(quantize_axis={quantize_axis}, rank={rank})"),
+                node_name.to_string(),
+            ));
+        }
+
+        let last_dim = *data.dims.last().unwrap();
+        let cols = if four_bit_dtype {
+            last_dim
+        } else {
+            last_dim * per_byte as i64
+        };
+        let packed_cols = if four_bit_dtype {
+            (last_dim + 1) / 2
+        } else {
+            last_dim
+        };
+        // Embedding tables: keep the table packed and dequantize gathered rows only.
+        let blocks_hint = (cols + block_size - 1) / block_size;
+        if normalize_axis_best_effort(gather_axis, data.dims.len()) == 0
+            && data.dims.len() == 2
+            && cols % blocks_hint == 0
+            && (bits == 8 || cols % 2 == 0)
+        {
+            return self.convert_gather_block_quantized_packed(
+                node,
+                node_name,
+                context,
+                b,
+                GbqTable {
+                    data,
+                    scales: scales_tensor,
+                    zero_points: inputs
+                        .get(3)
+                        .filter(|n| !n.is_empty())
+                        .and_then(|n| context.initializers.get(n.as_str()).copied()),
+                    bits,
+                    signed,
+                    cols,
+                    packed_cols,
+                    blocks: blocks_hint,
+                },
+            );
+        }
+        let rows: i64 = data.dims[..data.dims.len() - 1].iter().product();
+        let blocks = (cols + block_size - 1) / block_size;
+        let expected_scales: i64 = rows * blocks;
+        let scales = crate::onnx::ops::matmul::decode_float_tensor_as_f32(scales_tensor)?;
+        if (scales.len() as i64) < expected_scales {
+            return Err(OnnxError::InvalidShape(format!(
+                "GatherBlockQuantized scales hold {} values, need {expected_scales}",
+                scales.len()
+            )));
+        }
+
+        // Zero points: packed 4-bit per block when present, otherwise 8.
+        let zp_packed: Option<Vec<u8>> = match inputs.get(3).filter(|n| !n.is_empty()) {
+            Some(zp_name) => {
+                let zp = context
+                    .initializers
+                    .get(zp_name.as_str())
+                    .copied()
+                    .ok_or_else(|| {
+                        OnnxError::unsupported_op(
+                            "GatherBlockQuantized(non-constant zero_points)",
+                            node_name.to_string(),
+                        )
+                    })?;
+                Some(crate::onnx::builder::tensor_proto_to_bytes(zp)?)
+            }
+            None => None,
+        };
+        // Signed 4-bit values are two's complement nibbles.
+        let nibble_value = |q: u8| -> f32 {
+            if signed && q >= 8 {
+                f32::from(q) - 16.0
+            } else {
+                f32::from(q)
+            }
+        };
+        let default_zp = if signed {
+            0.0
+        } else {
+            f32::from(1u8 << (bits - 1))
+        };
+        let zp_at = |row: usize, block: usize| -> f32 {
+            match &zp_packed {
+                Some(bytes) => {
+                    let idx = row * blocks as usize + block;
+                    if per_byte == 2 {
+                        let byte = bytes.get(idx / 2).copied().unwrap_or(0x88);
+                        nibble_value(if idx % 2 == 0 { byte & 0x0F } else { byte >> 4 })
+                    } else {
+                        f32::from(bytes.get(idx).copied().unwrap_or(128))
+                    }
+                }
+                None => default_zp,
+            }
+        };
+
+        let packed = crate::onnx::builder::tensor_proto_to_bytes(data)?;
+        let (rows_u, cols_u, packed_u) = (rows as usize, cols as usize, packed_cols as usize);
+        let mut values = vec![0f32; rows_u * cols_u];
+        for row in 0..rows_u {
+            let row_bytes = &packed[row * packed_u..(row + 1) * packed_u];
+            let row_out = &mut values[row * cols_u..(row + 1) * cols_u];
+            for (i, value) in row_out.iter_mut().enumerate() {
+                let q = if per_byte == 2 {
+                    let byte = row_bytes[i / 2];
+                    if i % 2 == 0 {
+                        byte & 0x0F
+                    } else {
+                        byte >> 4
+                    }
+                } else {
+                    row_bytes[i]
+                };
+                let block = i / block_size as usize;
+                let q = if per_byte == 2 {
+                    nibble_value(q)
+                } else {
+                    f32::from(q)
+                };
+                *value = (q - zp_at(row, block)) * scales[row * blocks as usize + block];
+            }
+        }
+
+        let output_name = output_label(node, node_name);
+        let dtype = if scales_tensor.data_type == TensorProto_DataType::Float16 as i32 {
+            DataType::Float16
+        } else {
+            DataType::Float32
+        };
+        let mut table_shape: Vec<u32> = data.dims.iter().map(|&d| d as u32).collect();
+        *table_shape.last_mut().unwrap() = cols as u32;
+        let table_name = format!("{output_name}__dequant_table");
+        match dtype {
+            DataType::Float16 => {
+                let bytes: Vec<u8> = values
+                    .iter()
+                    .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                    .collect();
+                b.register_constant_from_bytes(
+                    &table_name,
+                    DataType::Float16,
+                    &table_shape,
+                    bytes,
+                )?;
+            }
+            _ => {
+                b.register_constant_from_bytes(
+                    &table_name,
+                    DataType::Float32,
+                    &table_shape,
+                    bytemuck::cast_slice::<f32, u8>(&values).to_vec(),
+                )?;
+            }
+        }
+
+        let gather_axis = normalize_axis_best_effort(gather_axis, data.dims.len());
+        let table = b.resolve_operand(&table_name)?;
+        let indices = b.resolve_operand(&inputs[1])?;
+        let out = b
+            .builder
+            .gather_with_options(
+                table,
+                indices,
+                MLGatherOptions {
+                    label: output_name.clone(),
+                    axis: gather_axis as u32,
+                },
+            )
+            .map_err(map_op_error)?;
+        if let Some(output) = node.output.as_slice().first() {
+            record_node_output(b, output, &output_name, out);
+        }
+        let mut result = ConversionResult::default();
+        if let Some(output) = node.output.as_slice().first() {
+            result.output_types.insert(output.to_string(), dtype);
+        }
         Ok(result)
     }
 
@@ -857,7 +1609,7 @@ impl UtilityHandler {
 
     /// Convert ONNX ReverseSequence to WebNN reverse along `time_axis`.
     ///
-    /// `sequence_lens` is accepted as the second input but not used yet — WebNN `reverse`
+    /// `sequence_lens` is accepted as the second input but not used yet - WebNN `reverse`
     /// reverses the full axis and has no per-sequence length support.
     fn convert_reverse_sequence(
         &self,
@@ -930,6 +1682,8 @@ impl UtilityHandler {
 
         let output_name = output_label(node, node_name);
         let mut slice_params: Option<(Vec<u32>, Vec<MLDimension>)> = None;
+        // Axes handled as full reverses (negative-step slices spanning the dim).
+        let mut reverse_axes: Vec<u32> = Vec::new();
 
         let read_ints = |name: &str, context: &ConversionContext| -> Option<Vec<i64>> {
             if let Some(vals) = context.const_values.get(name) {
@@ -1108,12 +1862,33 @@ impl UtilityHandler {
 
                 for i in 0..desired_len {
                     let axis = axes[i] as usize;
+                    if axis >= input_shape.len() {
+                        return Err(OnnxError::InvalidShape(format!(
+                            "Slice '{node_name}' axis {axis} out of bounds for input \
+                             '{}' with tracked shape {input_shape:?}",
+                            inputs[0]
+                        )));
+                    }
                     let dim = input_shape[axis];
                     let step = steps[i];
                     if step <= 0 {
-                        return Err(OnnxError::InvalidShape(
-                            "Slice currently requires positive step values".to_string(),
-                        ));
+                        // Full-axis reverse (torch.flip): step -1 spanning the
+                        // whole dimension lowers to WebNN reverse.
+                        let start_raw = starts_norm[i];
+                        let end_raw = ends_norm[i];
+                        let full = step == -1
+                            && (start_raw == -1 || start_raw >= dim - 1)
+                            && (end_raw <= -dim || end_raw <= i64::MIN + 1);
+                        if full {
+                            reverse_axes.push(axis as u32);
+                            dense_starts[axis] = 0;
+                            dense_sizes[axis] = dim;
+                            dense_strides[axis] = 1;
+                            continue;
+                        }
+                        return Err(OnnxError::InvalidShape(format!(
+                            "Slice '{node_name}' has unsupported step {step} on axis {axis}"
+                        )));
                     }
 
                     let mut start = starts_norm[i];
@@ -1156,8 +1931,10 @@ impl UtilityHandler {
                 ));
             } else {
                 return Err(OnnxError::InvalidShape(
-                    "Slice on unknown-rank tensors requires known input shape for WebNN"
-                        .to_string(),
+                    format!(
+                        "Slice '{node_name}' on unknown-rank tensor '{}' requires a known input shape for WebNN",
+                        inputs[0]
+                    ),
                 ));
             }
         } else {
@@ -1218,9 +1995,21 @@ impl UtilityHandler {
                     let dim = input_shape[axis];
                     let step = steps[i];
                     if step <= 0 {
-                        return Err(OnnxError::InvalidShape(
-                            "Slice currently requires positive step values".to_string(),
-                        ));
+                        let start_raw = starts[i];
+                        let end_raw = ends[i];
+                        let full = step == -1
+                            && (start_raw == -1 || start_raw >= dim - 1)
+                            && (end_raw <= -dim || end_raw <= i64::MIN + 1);
+                        if full {
+                            reverse_axes.push(axis as u32);
+                            dense_starts[axis] = 0;
+                            dense_sizes[axis] = dim;
+                            dense_strides[axis] = 1;
+                            continue;
+                        }
+                        return Err(OnnxError::InvalidShape(format!(
+                            "Slice '{node_name}' has unsupported step {step} on axis {axis}"
+                        )));
                     }
 
                     let mut start = starts[i];
@@ -1259,8 +2048,35 @@ impl UtilityHandler {
                 "Slice requires static starts/sizes for MLGraphBuilder".to_string(),
             )
         })?;
+        // A zero-size slice (start == end, e.g. `q[..., rotary_dim:]` when the
+        // rotary dim spans the whole head) cannot exist as a WebNN operand.
+        // Propagate an empty placeholder so consumers such as Concat drop it.
+        if sizes.iter().any(|d| d.static_or_max() == 0) {
+            b.mark_empty_optional(&output_name);
+            if let Some(onnx_out) = node.output.as_slice().first() {
+                b.mark_empty_optional(onnx_out);
+            }
+            return Ok(ConversionResult::default());
+        }
         let input = b.resolve_operand(&inputs[0])?;
-        let out = slice_with_params(b, input, &output_name, &starts, &sizes)?;
+        let slice_label = if reverse_axes.is_empty() {
+            output_name.clone()
+        } else {
+            format!("{output_name}__pre_reverse")
+        };
+        let mut out = slice_with_params(b, input, &slice_label, &starts, &sizes)?;
+        if !reverse_axes.is_empty() {
+            out = b
+                .builder
+                .reverse_with_options(
+                    out,
+                    MLReverseOptions {
+                        label: output_name.clone(),
+                        axes: Some(reverse_axes.clone()),
+                    },
+                )
+                .map_err(map_op_error)?;
+        }
         if let Some(output) = node.output.as_slice().first() {
             record_node_output(b, output, &output_name, out);
         }

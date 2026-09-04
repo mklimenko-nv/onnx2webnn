@@ -10,7 +10,7 @@ use crate::onnx::builder_helpers::{
     i64_slice_to_mldim, map_op_result, output_label, record_node_output, reshape_with_shape,
     slice_with_params,
 };
-use crate::onnx::convert::OnnxError;
+use crate::onnx::convert::{sanitize_identifier, OnnxError};
 use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
 use crate::protos::onnx::NodeProto;
 use rustnn::mlcontext::MLOperand;
@@ -34,8 +34,11 @@ impl OpHandler for RnnHandler {
         b: &mut OnnxBuilder<'_, '_, '_>,
     ) -> Result<ConversionResult, OnnxError> {
         let op_type = node.op_type.as_str();
+        // Sanitized: it seeds operand labels, which become MIL value names in the
+        // CoreML backend (raw ONNX names like `/lstm/LSTM` contain `/`, which the
+        // MIL parser rejects).
         let node_name = if !node.name.is_empty() {
-            node.name.clone()
+            sanitize_identifier(&node.name)
         } else {
             "unnamed".to_string()
         };
@@ -385,7 +388,8 @@ impl RnnHandler {
             )));
         }
 
-        validate_rnn_attrs(node, node_name, "GRU")?;
+        let direction = validate_rnn_attrs(node, node_name, "GRU")?;
+        let bidirectional = direction == "both";
         reject_optional_rnn_inputs(inputs, 4, node_name, "GRU")?;
 
         let hidden_size = require_hidden_size(node, "GRU")?;
@@ -416,12 +420,14 @@ impl RnnHandler {
         )?;
         let steps = resolve_steps(context, &inputs[0]);
 
+        let num_directions = if bidirectional { 2 } else { 1 };
         let (bias, recurrent_bias) = split_combined_bias(
             b,
             node_name,
             inputs.get(3).map(String::as_str),
             gate_bias_len,
             compute_f32,
+            num_directions,
         )?;
 
         let outputs = node.output.as_slice();
@@ -441,7 +447,7 @@ impl RnnHandler {
             bias,
             recurrent_bias,
             return_sequence: wants_sequence,
-            direction: "forward".to_string(),
+            direction,
             reset_after: linear_before_reset != 0,
             ..Default::default()
         };
@@ -457,7 +463,8 @@ impl RnnHandler {
             let seq = gru_outputs.get(1).copied().ok_or_else(|| {
                 OnnxError::InvalidShape("GRU missing sequence output".to_string())
             })?;
-            let mapped = map_onnx_sequence_output(b, node_name, seq, context, &outputs[0])?;
+            let mapped =
+                map_onnx_sequence_output(b, node_name, seq, context, &outputs[0], bidirectional)?;
             let mapped = maybe_cast_for_rnn(
                 b,
                 mapped,
@@ -500,8 +507,23 @@ impl RnnHandler {
             )));
         }
 
-        validate_rnn_attrs(node, node_name, "LSTM")?;
-        reject_optional_rnn_inputs(inputs, 4, node_name, "LSTM")?;
+        let direction = validate_rnn_attrs(node, node_name, "LSTM")?;
+        let bidirectional = direction == "both";
+        // sequence_lens (input 4) is unsupported; initial_h/initial_c (5/6)
+        // map to WebNN initialHiddenState/initialCellState. Peephole (7) is
+        // unsupported.
+        if inputs.get(4).is_some_and(|n| !n.is_empty()) {
+            return Err(OnnxError::unsupported_op(
+                "LSTM(sequence_lens)",
+                node_name.to_string(),
+            ));
+        }
+        if inputs.get(7).is_some_and(|n| !n.is_empty()) {
+            return Err(OnnxError::unsupported_op(
+                "LSTM(peephole)",
+                node_name.to_string(),
+            ));
+        }
 
         let hidden_size = require_hidden_size(node, "LSTM")?;
         let gate_bias_len = 4u32 * hidden_size;
@@ -531,12 +553,14 @@ impl RnnHandler {
         )?;
         let steps = resolve_steps(context, &inputs[0]);
 
+        let num_directions = if bidirectional { 2 } else { 1 };
         let (bias, recurrent_bias) = split_combined_bias(
             b,
             node_name,
             inputs.get(3).map(String::as_str),
             gate_bias_len,
             compute_f32,
+            num_directions,
         )?;
 
         let outputs = node.output.as_slice();
@@ -544,13 +568,33 @@ impl RnnHandler {
         let wants_hidden = outputs.get(1).is_some_and(|name| !name.is_empty());
         let wants_cell = outputs.get(2).is_some_and(|name| !name.is_empty());
 
+        let mut initial_state = |idx: usize, tag: &str| -> Result<Option<u32>, OnnxError> {
+            match inputs.get(idx).filter(|n| !n.is_empty()) {
+                Some(name) => {
+                    let op = maybe_cast_for_rnn(
+                        b,
+                        b.resolve_operand(name)?,
+                        compute_f32,
+                        DataType::Float32,
+                        &format!("{node_name}_{tag}_f32"),
+                    )?;
+                    Ok(Some(operand_index(op)))
+                }
+                None => Ok(None),
+            }
+        };
+        let initial_hidden_state = initial_state(5, "h0")?;
+        let initial_cell_state = initial_state(6, "c0")?;
+
         let label = output_label(node, node_name);
         let options = MLLstmOptions {
             label: label.clone(),
             bias,
             recurrent_bias,
+            initial_hidden_state,
+            initial_cell_state,
             return_sequence: wants_sequence,
-            direction: "forward".to_string(),
+            direction,
             ..Default::default()
         };
 
@@ -565,7 +609,8 @@ impl RnnHandler {
             let seq = lstm_outputs.get(2).copied().ok_or_else(|| {
                 OnnxError::InvalidShape("LSTM missing sequence output".to_string())
             })?;
-            let mapped = map_onnx_sequence_output(b, node_name, seq, context, &outputs[0])?;
+            let mapped =
+                map_onnx_sequence_output(b, node_name, seq, context, &outputs[0], bidirectional)?;
             let mapped = maybe_cast_for_rnn(
                 b,
                 mapped,
@@ -652,17 +697,25 @@ fn require_hidden_size(node: &NodeProto, op: &str) -> Result<u32, OnnxError> {
     })
 }
 
-fn validate_rnn_attrs(node: &NodeProto, node_name: &str, op: &str) -> Result<(), OnnxError> {
+/// Validate shared RNN attributes and map the ONNX direction to WebNN's
+/// ("forward" | "backward" | "both").
+fn validate_rnn_attrs(node: &NodeProto, node_name: &str, op: &str) -> Result<String, OnnxError> {
+    let mut webnn_direction = "forward".to_string();
     for attr in node.attribute.as_slice() {
         match attr.name.as_str() {
             "direction" => {
-                let direction = String::from_utf8_lossy(&attr.s);
-                if !direction.is_empty() && direction != "forward" && direction != "FORWARD" {
-                    return Err(OnnxError::unsupported_op(
-                        format!("{op}(direction={direction})"),
-                        node_name.to_string(),
-                    ));
-                }
+                let direction = String::from_utf8_lossy(&attr.s).to_lowercase();
+                webnn_direction = match direction.as_str() {
+                    "" | "forward" => "forward".to_string(),
+                    "reverse" => "backward".to_string(),
+                    "bidirectional" => "both".to_string(),
+                    other => {
+                        return Err(OnnxError::unsupported_op(
+                            format!("{op}(direction={other})"),
+                            node_name.to_string(),
+                        ));
+                    }
+                };
             }
             "layout" => {
                 let layout = String::from_utf8_lossy(&attr.s);
@@ -682,7 +735,7 @@ fn validate_rnn_attrs(node: &NodeProto, node_name: &str, op: &str) -> Result<(),
             _ => {}
         }
     }
-    Ok(())
+    Ok(webnn_direction)
 }
 
 fn reject_optional_rnn_inputs(
@@ -721,6 +774,7 @@ fn split_combined_bias(
     bias_name: Option<&str>,
     gate_bias_len: u32,
     compute_f32: bool,
+    num_directions: u32,
 ) -> Result<(Option<u32>, Option<u32>), OnnxError> {
     let Some(name) = bias_name.filter(|n| !n.is_empty()) else {
         return Ok((None, None));
@@ -740,14 +794,20 @@ fn split_combined_bias(
         combined,
         &format!("{node_name}_bias"),
         &[0, 0],
-        &[MLDimension::Static(1), MLDimension::Static(half)],
+        &[
+            MLDimension::Static(num_directions),
+            MLDimension::Static(half),
+        ],
     )?;
     let recurrent_bias = slice_with_params(
         b,
         combined,
         &format!("{node_name}_recurrent_bias"),
         &[0, half],
-        &[MLDimension::Static(1), MLDimension::Static(half)],
+        &[
+            MLDimension::Static(num_directions),
+            MLDimension::Static(half),
+        ],
     )?;
     Ok((
         Some(operand_index(bias)),
@@ -762,8 +822,14 @@ fn map_onnx_sequence_output(
     seq: MLOperand,
     context: &ConversionContext,
     onnx_output: &str,
+    bidirectional: bool,
 ) -> Result<MLOperand, OnnxError> {
     let expected_rank = context.resolve_shape(onnx_output).map(|shape| shape.len());
+
+    // Bidirectional: WebNN [steps, 2, batch, hidden] already matches ONNX Y.
+    if bidirectional {
+        return Ok(seq);
+    }
 
     match expected_rank {
         Some(3) => {

@@ -24,13 +24,16 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 pub mod activation;
+pub mod attention;
 pub mod comparison;
 pub mod conditional;
 pub mod conv;
 pub mod conversion;
+pub mod einsum;
 pub mod elementwise;
 pub mod matmul;
 pub mod misc;
+pub mod moe;
 pub mod normalization;
 pub mod pad;
 pub mod pool;
@@ -42,13 +45,16 @@ pub mod scatter;
 pub mod utility;
 
 use activation::ActivationHandler;
+use attention::AttentionHandler;
 use comparison::ComparisonHandler;
 use conditional::ConditionalHandler;
 use conv::ConvHandler;
 use conversion::ConversionHandler;
+use einsum::EinsumHandler;
 use elementwise::ElementwiseHandler;
 use matmul::MatMulHandler;
 use misc::MiscHandler;
+use moe::MoeHandler;
 use normalization::NormalizationHandler;
 use pad::PadHandler;
 use pool::PoolHandler;
@@ -165,6 +171,9 @@ impl OpRegistry {
     pub fn new() -> Self {
         let handlers: Vec<Box<dyn OpHandler>> = vec![
             Box::new(MatMulHandler),
+            Box::new(AttentionHandler),
+            Box::new(MoeHandler),
+            Box::new(EinsumHandler),
             Box::new(ConvHandler),
             Box::new(PoolHandler),
             Box::new(ElementwiseHandler),
@@ -231,6 +240,25 @@ impl OpRegistry {
         builder: &mut crate::onnx::builder::OnnxBuilder<'_, '_, '_>,
     ) -> Result<ConversionResult, OnnxError> {
         let op_type = node.op_type.as_str();
+
+        // Zero-size values (an empty Slice, a Reshape of it, ...) have no WebNN
+        // representation. When shape inference proves every output empty, mark
+        // them like empty optional inputs so consumers such as Concat drop them.
+        let outputs: Vec<&String> = node.output.iter().filter(|o| !o.is_empty()).collect();
+        if !outputs.is_empty()
+            && outputs.iter().all(|o| {
+                context
+                    .value_shapes
+                    .get(o.as_str())
+                    .is_some_and(|shape| shape.contains(&0))
+            })
+        {
+            for out in outputs {
+                builder.mark_empty_optional(out);
+                builder.mark_empty_optional(&crate::onnx::convert::sanitize_identifier(out));
+            }
+            return Ok(ConversionResult::default());
+        }
 
         for handler in &self.handlers {
             if handler.supports(op_type) {
@@ -350,7 +378,7 @@ fn register_test_operand(
         } else {
             dummy_constant_bytes(dtype, numel)
         };
-        builder.register_constant_from_bytes(name, dtype, &shape, &bytes)?;
+        builder.register_constant_from_bytes(name, dtype, &shape, bytes)?;
         return Ok(());
     }
 
