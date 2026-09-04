@@ -27,6 +27,10 @@ jobs:
     # backend; op coverage there may lag the ORT backend, so it reports
     # without blocking until it has a green track record.
     continue-on-error: ${{ matrix.experimental || false }}
+    # The macOS sweep has taken 50+ min when a rustnn regression makes CoreML
+    # compiles pathological; kill runaway jobs instead of holding a runner for
+    # the 6 h default.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +52,10 @@ jobs:
             # the feature is compiled in (ORT still serves as the reference).
             cargo_flags: --features coreml
             experimental: true
+            # CoreML graph compiles peak at ~5 GB for the largest sweep
+            # entries; two in flight exceed the 7 GB macOS runner and it
+            # falls into memory-compression/swap churn.
+            model_test_jobs: 1
     defaults:
       run:
         shell: bash
@@ -148,6 +156,6 @@ jobs:
         env:
           # Optional; raises Hub rate limits if the repository defines it.
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          O2W_MODEL_TEST_JOBS: 2
+          O2W_MODEL_TEST_JOBS: ${{ matrix.model_test_jobs || 2 }}
           O2W_MODEL_TEST_SKIP_HEAVY: 1
         run: cargo test --release --locked ${{ matrix.cargo_flags }}

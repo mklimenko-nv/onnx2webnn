@@ -53,6 +53,11 @@ struct Entry {
     /// `--features coreml`; still exercised on the ORT backend.
     #[serde(default)]
     coreml_unsupported: Option<String>,
+    /// Reason this model, while it does build on CoreML, takes so long there
+    /// that it would dominate the sweep (e.g. pathological Espresso compile
+    /// times). Skipped like `coreml_unsupported`.
+    #[serde(default)]
+    coreml_slow: Option<String>,
     #[serde(default)]
     override_dims: HashMap<String, u32>,
     #[serde(default)]
@@ -256,7 +261,7 @@ fn manifest_models_convert_and_build() {
         .into_iter()
         .filter(|e| {
             if cfg!(feature = "coreml") {
-                if let Some(reason) = &e.coreml_unsupported {
+                if let Some(reason) = e.coreml_unsupported.as_ref().or(e.coreml_slow.as_ref()) {
                     eprintln!("skipping {} on CoreML: {reason}", e.file);
                     return false;
                 }
