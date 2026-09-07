@@ -75,3 +75,16 @@ This document records operators currently unsupported by `onnx2webnn`, grouped b
 ## [AdamCodd/distilroberta-nsfw-prompt-stable-diffusion](https://huggingface.co/AdamCodd/distilroberta-nsfw-prompt-stable-diffusion)
 
 - Gated repository (HTTP 401 without a token); not evaluated
+
+## [Mozilla/distilvit](https://huggingface.co/Mozilla/distilvit)
+
+- `onnx/decoder_model_merged*.onnx` — the cached-attention `If` branch's `Reshape` shape input (`.../attn/Concat_*_output_0`) is not constant-folded, so its target shape can't be resolved from the branch's `Transpose` output; open (encoder_model converts)
+
+## [onnx-community/pyannote-segmentation-3.0](https://huggingface.co/onnx-community/pyannote-segmentation-3.0)
+
+- ONNX model: `onnx/model*.onnx`
+- Unsupported operators: the quantized export uses the com.microsoft fusion `DynamicQuantizeLSTM` (four LSTM layers)
+
+## [Xenova/nllb-200-distilled-600M](https://huggingface.co/Xenova/nllb-200-distilled-600M)
+
+- `onnx/decoder_model_merged*.onnx` — the shared output-embedding bias reshape mis-derives its target shape from `decoder_sequence_length` instead of the vocab size, producing an incompatible broadcast (`decoder_sequence_length` vs. 256206); open (encoder_model converts)
