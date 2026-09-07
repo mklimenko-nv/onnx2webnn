@@ -48,6 +48,8 @@ pub fn assert_op_matches_ort_with_options(
     test_opset: i64,
     options: &ConvertOptions,
 ) {
+    // Backend build errors are only visible through `log` (RUST_LOG=error).
+    let _ = pretty_env_logger::try_init();
     let declared_opset = model
         .opset_import
         .iter()
@@ -719,6 +721,10 @@ fn assert_same_values(name: &str, expected: &[f64], actual: &[f64], is_float16: 
         actual.len(),
         "output length mismatch for {name}"
     );
+    let max_abs_expected = expected
+        .iter()
+        .filter(|e| e.is_finite())
+        .fold(0.0f64, |m, e| m.max(e.abs()));
     for (i, (e, a)) in expected.iter().zip(actual.iter()).enumerate() {
         if e.is_nan() && a.is_nan() {
             continue;
@@ -731,12 +737,24 @@ fn assert_same_values(name: &str, expected: &[f64], actual: &[f64], is_float16: 
         // Absolute floor for near-zero values plus a relative term so values of
         // large magnitude tolerate backend rounding differences (CoreML's
         // FMA/accumulation order differs from ORT's by a few float32 ULPs).
+        // TensorRT-RTX has no kFP16 flag and may run float32 layers in fp16 with
+        // fp16 accumulation, so its float32 outputs get an fp16-class tolerance
+        // scaled by the tensor's largest magnitude: accumulation error follows the
+        // summed terms, not a possibly cancelled result.
+        let trtx_float32 = cfg!(feature = "trtx") && !is_float16;
         let (abs_tolerance, rel_tolerance) = if is_float16 {
             (1e-2, 1e-3)
+        } else if trtx_float32 {
+            (2e-3, 4e-3)
         } else {
             (1e-5, 1e-6)
         };
-        let tolerance = abs_tolerance + rel_tolerance * e.abs();
+        let scale = if trtx_float32 {
+            max_abs_expected
+        } else {
+            e.abs()
+        };
+        let tolerance = abs_tolerance + rel_tolerance * scale;
         assert!(
             (rounded_e - rounded_a).abs() <= tolerance,
             "output {name}[{i}] mismatch: ORT={rounded_e}, rustnn={rounded_a}"

@@ -407,11 +407,10 @@ pub fn convert_handler_with_context(
     context: &ConversionContext,
 ) -> Result<ConversionResult, OnnxError> {
     use crate::onnx::builder::{map_rustnn_error, OnnxBuilder};
-    use rustnn::mlcontext::{MLContext, MLContextOptions, MLGraphBuilder, MLPowerPreference};
+    use rustnn::mlcontext::{MLContext, MLGraphBuilder};
 
-    let mut ml_context =
-        MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, false))
-            .map_err(|e| OnnxError::ShapeInference(format!("MLContext::create failed: {e}")))?;
+    let mut ml_context = MLContext::create(&crate::onnx::convert::backend_context_options())
+        .map_err(|e| OnnxError::ShapeInference(format!("MLContext::create failed: {e}")))?;
     let mut ml_builder = MLGraphBuilder::new(&mut ml_context).map_err(map_rustnn_error)?;
     let mut builder = OnnxBuilder::new(&mut ml_builder);
     for input in node.input.iter() {

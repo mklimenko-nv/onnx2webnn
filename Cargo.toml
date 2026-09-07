@@ -17,6 +17,9 @@ path = "src/main.rs"
 # Enable rustnn's CoreML backend (macOS only). With this feature compiled,
 # MLContext::create selects CoreML automatically on macOS.
 coreml = ["rustnn/coreml-runtime"]
+# Enable rustnn's TensorRT-RTX backend (NVIDIA GPU). With this feature compiled,
+# MLContext::create requests it explicitly instead of falling back to ORT.
+trtx = ["rustnn/trtx-runtime"]
 
 [dependencies]
 anyhow = "1.0"
@@ -32,5 +35,6 @@ bytemuck = "1.15"
 webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main" }
 
 [dev-dependencies]
+pretty_env_logger = "0.5"
 tempfile = "3.8"
 ureq = { version = "2.10", default-features = false, features = ["tls"] }

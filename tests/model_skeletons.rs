@@ -242,6 +242,8 @@ impl Sweep {
 
 #[test]
 fn manifest_models_convert_and_build() {
+    // Backend build errors are only visible through `log` (RUST_LOG=error).
+    let _ = pretty_env_logger::try_init();
     // O2W_MANIFEST points at another manifest (e.g. candidates under evaluation).
     let manifest_path = std::env::var_os("O2W_MANIFEST")
         .filter(|v| !v.is_empty())

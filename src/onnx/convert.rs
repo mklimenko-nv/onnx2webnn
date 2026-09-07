@@ -1873,6 +1873,20 @@ fn inline_constant_ifs(model: &mut ModelProto, options: &ConvertOptions) {
     }
 }
 
+/// ORT by default; with the `trtx` feature, TensorRT-RTX is requested explicitly so a
+/// missing GPU or DLL fails instead of silently validating on ORT.
+pub(crate) fn backend_context_options() -> MLContextOptions {
+    #[cfg(feature = "trtx")]
+    {
+        MLContextOptions::new(MLPowerPreference::Default, true)
+            .with_rustnn_backend_hint(rustnn::mlcontext::Backend::Trtx)
+    }
+    #[cfg(not(feature = "trtx"))]
+    {
+        MLContextOptions::new(MLPowerPreference::Default, false)
+    }
+}
+
 /// Lower an in-memory ONNX [`ModelProto`] to [`MLGraphBuilder`] and validate with ORT `build()`.
 pub fn convert_model_proto(
     model: ModelProto,
@@ -1908,7 +1922,7 @@ pub(crate) fn convert_model(
     let mut converter = OnnxConverter::new(model)?;
     converter.extract_metadata()?;
 
-    let mut context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, false))
+    let mut context = MLContext::create(&backend_context_options())
         .map_err(|e| OnnxError::ShapeInference(format!("MLContext::create failed: {e}")))?;
 
     let mut ml_builder = MLGraphBuilder::new(&mut context).map_err(map_rustnn_error)?;
