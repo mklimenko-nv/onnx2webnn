@@ -20,43 +20,49 @@ use rustnn::operator_enums::MLOperandDataType;
 use rustnn::operator_options::{MLGemmOptions, MLTransposeOptions};
 use rustnn::DataType;
 
-/// bitsandbytes 4-bit codebooks, copied verbatim from ONNX Runtime's
-/// `blockwise_quant_block_bnb4.h` so dequantization matches ORT bit-for-bit.
+/// bitsandbytes FP4 codebook, indexed by the 4-bit code. Bit 3 is the sign;
+/// the low three bits select one of the format's eight magnitudes
+/// {0, 1/192, 2/3, 1, 1/3, 1/2, 1/6, 1/4} (see the `FP4` data type in
+/// bitsandbytes, Dettmers et al., "8-bit Optimizers via Block-wise
+/// Quantization", 2022).
 const FP4_QUANT_MAP: [f32; 16] = [
     0.0,
-    5.208_333_5e-3,
-    0.666_666_7,
+    1.0 / 192.0,
+    2.0 / 3.0,
     1.0,
-    0.333_333_34,
+    1.0 / 3.0,
     0.5,
-    0.166_666_67,
+    1.0 / 6.0,
     0.25,
     -0.0,
-    -5.208_333_5e-3,
-    -0.666_666_7,
+    -1.0 / 192.0,
+    -2.0 / 3.0,
     -1.0,
-    -0.333_333_34,
+    -1.0 / 3.0,
     -0.5,
-    -0.166_666_67,
+    -1.0 / 6.0,
     -0.25,
 ];
 
+/// NormalFloat4 codebook: the 16 quantiles of N(0, 1) normalised to [-1, 1]
+/// as listed in Dettmers et al., "QLoRA: Efficient Finetuning of Quantized
+/// LLMs", 2023, Appendix E (bitsandbytes `create_normal_map`).
 const NF4_QUANT_MAP: [f32; 16] = [
     -1.0,
-    -0.696_192_8,
-    -0.525_073_05,
-    -0.394_917_5,
-    -0.284_441_38,
-    -0.184_773_43,
-    -0.091_050_036,
+    -0.696_192_800_998_687_7_f64 as f32,
+    -0.525_073_051_452_636_7_f64 as f32,
+    -0.394_917_488_098_144_53_f64 as f32,
+    -0.284_441_381_692_886_35_f64 as f32,
+    -0.184_773_430_228_233_34_f64 as f32,
+    -0.091_050_036_251_544_95_f64 as f32,
     0.0,
-    0.079_580_3,
-    0.160_930_2,
-    0.246_112_3,
-    0.337_915_24,
-    0.440_709_83,
-    0.562_617,
-    0.722_956_84,
+    0.079_580_299_556_255_34_f64 as f32,
+    0.160_930_201_411_247_25_f64 as f32,
+    0.246_112_301_945_686_34_f64 as f32,
+    0.337_915_241_718_292_24_f64 as f32,
+    0.440_709_829_330_444_34_f64 as f32,
+    0.562_617_003_917_694_1_f64 as f32,
+    0.722_956_836_223_602_3_f64 as f32,
     1.0,
 ];
 
