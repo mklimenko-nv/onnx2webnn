@@ -6,5 +6,8 @@
 //! Shared helpers for ONNX op conversion integration tests.
 
 mod runner;
+pub mod skeleton;
 
-pub use runner::{assert_op_matches_ort, ExpectConvertOp};
+// Not every test crate uses every helper.
+#[allow(unused_imports)]
+pub use runner::{assert_op_matches_ort, assert_op_matches_ort_with_options, ExpectConvertOp};

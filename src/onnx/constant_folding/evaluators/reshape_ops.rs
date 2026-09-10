@@ -205,7 +205,7 @@ impl CastEvaluator {
         target_type: TensorProto_DataType,
     ) -> Result<TensorData, OnnxError> {
         match (data, target_type) {
-            // Int64 → other types
+            // Int64 -> other types
             (TensorData::Int64(v), TensorProto_DataType::Int64) => Ok(TensorData::Int64(v.clone())),
             (TensorData::Int64(v), TensorProto_DataType::Int32) => {
                 Ok(TensorData::Int32(v.iter().map(|&x| x as i32).collect()))
@@ -217,7 +217,7 @@ impl CastEvaluator {
                 Ok(TensorData::Float64(v.iter().map(|&x| x as f64).collect()))
             }
 
-            // Int32 → other types
+            // Int32 -> other types
             (TensorData::Int32(v), TensorProto_DataType::Int32) => Ok(TensorData::Int32(v.clone())),
             (TensorData::Int32(v), TensorProto_DataType::Int64) => {
                 Ok(TensorData::Int64(v.iter().map(|&x| x as i64).collect()))
@@ -229,7 +229,7 @@ impl CastEvaluator {
                 Ok(TensorData::Float64(v.iter().map(|&x| x as f64).collect()))
             }
 
-            // Float32 → other types
+            // Float32 -> other types
             (TensorData::Float32(v), TensorProto_DataType::Float) => {
                 Ok(TensorData::Float32(v.clone()))
             }
@@ -243,7 +243,7 @@ impl CastEvaluator {
                 Ok(TensorData::Int32(v.iter().map(|&x| x as i32).collect()))
             }
 
-            // Float64 → other types
+            // Float64 -> other types
             (TensorData::Float64(v), TensorProto_DataType::Double) => {
                 Ok(TensorData::Float64(v.clone()))
             }

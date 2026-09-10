@@ -52,6 +52,11 @@ _FP16_EXCLUDED_OPS = frozenset(
         # Constant and Shape have little value as fp16 runtime coverage.
         "Constant",
         "Shape",
+        # Spec restricts the input to tensor(float); no fp16 form exists.
+        "DynamicQuantizeLinear",
+        # The dtype rewrite does not recurse into subgraph attributes, so an
+        # fp16 If fixture has f32 branch internals and is invalid ONNX.
+        "If",
     }
 )
 
@@ -442,8 +447,15 @@ def _emit_op_file(
     variants: list[dict],
 ) -> str:
     """Emit one Rust test module with one test per schema-revision opset."""
-    opsets = [v["opset"] for v in variants]
-    opset_summary = ", ".join(str(o) for o in opsets)
+    base_opsets = [str(v["opset"]) for v in variants if not v.get("dtype_suffix")]
+    dtype_labels = [
+        f"{v['dtype_suffix']} @ opset {v['opset']}"
+        for v in variants
+        if v.get("dtype_suffix")
+    ]
+    opset_summary = ", ".join(base_opsets)
+    if dtype_labels:
+        opset_summary += "; dtype variants: " + ", ".join(dtype_labels)
     # Ignored stubs use neither the runner nor `ModelProto`; skip imports when every variant is a
     # stub to avoid unused-import warnings.
     has_buildable = any(v.get("build_error") is None for v in variants)
@@ -512,6 +524,12 @@ def _format_generated_rust(paths: list[Path]) -> None:
     )
 
 
+def _same_model(a, b) -> bool:
+    return a.SerializeToString(deterministic=True) == b.SerializeToString(
+        deterministic=True
+    )
+
+
 def _should_emit_float16_variant(op_type: str, expect: str) -> bool:
     return expect == "ExpectConvertOp::Success" and op_type not in _FP16_EXCLUDED_OPS
 
@@ -574,15 +592,18 @@ def generate(*, min_opset: int, max_opset: int) -> tuple[int, int, int]:
                 model = build_test_model(
                     op_type, opset, input_elem_type=TensorProto.FLOAT16
                 )
-                variants.append(
-                    {
-                        "opset": opset,
-                        "expect": expect,
-                        "model": model,
-                        "dtype_suffix": "float16",
-                    }
-                )
-                built += 1
+                # Integer-only fixtures (e.g. MatMulInteger) are unchanged by the
+                # dtype rewrite; skip the duplicate rather than run the base test twice.
+                if not _same_model(model, build_test_model(op_type, opset)):
+                    variants.append(
+                        {
+                            "opset": opset,
+                            "expect": expect,
+                            "model": model,
+                            "dtype_suffix": "float16",
+                        }
+                    )
+                    built += 1
             except Exception:
                 # Not every WebNN-supported op has a meaningful fp16 ONNX fixture
                 # (e.g. concrete tensor(float) control inputs). Keep generation quiet.
@@ -595,15 +616,18 @@ def generate(*, min_opset: int, max_opset: int) -> tuple[int, int, int]:
                     model = build_test_model(
                         op_type, bf16_opset, input_elem_type=TensorProto.BFLOAT16
                     )
-                    variants.append(
-                        {
-                            "opset": bf16_opset,
-                            "expect": "ExpectConvertOp::ConversionError",
-                            "model": model,
-                            "dtype_suffix": "bfloat16",
-                        }
-                    )
-                    built += 1
+                    # An unchanged model would assert ConversionError on a graph the
+                    # base test expects to convert — skip dtype-independent fixtures.
+                    if not _same_model(model, build_test_model(op_type, bf16_opset)):
+                        variants.append(
+                            {
+                                "opset": bf16_opset,
+                                "expect": "ExpectConvertOp::ConversionError",
+                                "model": model,
+                                "dtype_suffix": "bfloat16",
+                            }
+                        )
+                        built += 1
                 except Exception:
                     # Skip ops whose primary input can't carry a standalone bfloat16
                     # fixture (e.g. bool/int-keyed primary inputs, unbuildable schemas).

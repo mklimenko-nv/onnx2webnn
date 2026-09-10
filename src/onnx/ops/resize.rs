@@ -4,11 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// ONNX Resize → WebNN resample2d (4-D NCHW, spatial axes [2, 3] for now).
+// ONNX Resize -> WebNN resample2d (4-D NCHW, spatial axes [2, 3] for now).
 
 use crate::onnx::builder::{map_op_error, OnnxBuilder};
-use crate::onnx::builder_helpers::{output_label, record_node_output};
+use crate::onnx::builder_helpers::{
+    i64_slice_to_mldim, output_label, record_node_output, reshape_with_shape,
+};
 use crate::onnx::convert::OnnxError;
+use crate::onnx::ops::conv::lookup_shape;
 use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
 use crate::protos::onnx::{NodeProto, TensorProto, TensorProto_DataType};
 use rustnn::operator_options::MLResample2dOptions;
@@ -40,6 +43,10 @@ impl OpHandler for ResizeHandler {
         }
 
         let mode = parse_resize_mode(node)?;
+        // 3-D input (N, C, W): resample along W through a 4-D (N, C, 1, W) view.
+        if let Some(shape) = lookup_shape(&inputs[0], context).filter(|s| s.len() == 3) {
+            return convert_1d_resize(node, &node_name, context, b, &mode, &shape);
+        }
         let axes: [usize; 2] = [2, 3];
         let (spatial_scales, spatial_sizes) =
             resolve_spatial_resample_params(node, context, &axes)?;
@@ -65,6 +72,87 @@ impl OpHandler for ResizeHandler {
         }
         Ok(ConversionResult::default())
     }
+}
+
+/// Resize of a rank-3 tensor along its last axis (e.g. temporal position
+/// embeddings): reshape to (N, C, 1, W), resample2d, reshape back.
+fn convert_1d_resize(
+    node: &NodeProto,
+    node_name: &str,
+    context: &ConversionContext,
+    b: &mut OnnxBuilder<'_, '_, '_>,
+    mode: &str,
+    shape: &[i64],
+) -> Result<ConversionResult, OnnxError> {
+    let inputs = node.input.as_slice();
+    let optional = |idx: usize| {
+        inputs
+            .get(idx)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.as_str())
+            .filter(|name| !is_empty_optional_tensor(name, context))
+    };
+    let (scales, sizes, out_w) = if let Some(name) = optional(3) {
+        let sizes = read_int64_sizes(name, context).ok_or_else(|| {
+            OnnxError::InvalidShape(format!("Resize sizes value '{name}' not found"))
+        })?;
+        if sizes.len() != 3 {
+            return Err(OnnxError::InvalidShape(format!(
+                "Resize sizes length {} does not match 3-D input",
+                sizes.len()
+            )));
+        }
+        let w = u32::try_from(sizes[2].max(1)).unwrap_or(1);
+        (vec![1.0, 1.0], Some(vec![1, w]), i64::from(w))
+    } else if let Some(name) = optional(2) {
+        let scales = read_float32_initializer(name, context)?
+            .filter(|s| s.len() == 3)
+            .ok_or_else(|| {
+                OnnxError::InvalidShape(format!(
+                    "Resize scales value '{name}' must hold 3 values for a 3-D input"
+                ))
+            })?;
+        let out_w = ((shape[2] as f32) * scales[2]).floor().max(1.0) as i64;
+        (vec![1.0, scales[2]], None, out_w)
+    } else {
+        return Err(OnnxError::InvalidShape(
+            "Resize requires sizes or scales".to_string(),
+        ));
+    };
+
+    let output_name = output_label(node, node_name);
+    let input = b.resolve_operand(&inputs[0])?;
+    let x4 = reshape_with_shape(
+        b,
+        input,
+        &format!("{output_name}_4d"),
+        i64_slice_to_mldim(&[shape[0], shape[1], 1, shape[2]])?,
+    )?;
+    let resampled = b
+        .builder
+        .resample2d_with_options(
+            x4,
+            MLResample2dOptions {
+                label: format!("{output_name}_resample"),
+                mode: mode.to_string(),
+                scales,
+                sizes,
+                axes: vec![2, 3],
+            },
+        )
+        .map_err(map_op_error)?;
+    let out = reshape_with_shape(
+        b,
+        resampled,
+        &output_name,
+        i64_slice_to_mldim(&[shape[0], shape[1], out_w])?,
+    )?;
+    if let Some(onnx_out) = node.output.first() {
+        record_node_output(b, onnx_out, &output_name, out);
+    } else {
+        b.record_operand(&[&output_name], out);
+    }
+    Ok(ConversionResult::default())
 }
 
 fn parse_resize_mode(node: &NodeProto) -> Result<String, OnnxError> {

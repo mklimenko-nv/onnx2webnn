@@ -36,16 +36,51 @@ cargo run -- convert --input model.onnx `
 If `model.dims.json` sits beside the ONNX file and no overrides were passed on the CLI, dimension
 bindings are loaded from that sidecar (`freeDimensionOverrides` or a flat JSON object).
 
+Merged decoders (optimum's `decoder_model_merged*.onnx`) branch at runtime on `use_cache_branch`.
+WebNN has no runtime `If`, so pin the input and convert each branch separately:
+
+```powershell
+cargo run -- convert --input decoder_model_merged.onnx --optimize `
+  --pin-input use_cache_branch=false `
+  --override-dim batch_size=1 --override-dim decoder_sequence_length=4 `
+  --override-dim past_decoder_sequence_length=0 ...
+```
+
+Pinned inputs become constants, the chosen `If` branch is inlined, and inputs the branch never
+reads (e.g. the KV cache in the prefill branch) and zero-size dummy outputs are dropped.
+
 | Flag | Purpose |
 |------|---------|
 | `--input` | Input `.onnx` path (required) |
 | `--optimize` | Constant folding and shape propagation |
-| `--override-dim NAME=VALUE` | Bind a symbolic dim (repeatable) |
+| `--override-dim NAME=VALUE` | Bind a symbolic dim (repeatable); unnamed zero dims are addressed as `<input>_dim<axis>` |
 | `--override-dims-file` | JSON overrides (`freeDimensionOverrides` or flat object) |
+| `--pin-input NAME=VALUE` | Freeze a graph input to `true`/`false`/an integer (repeatable) |
+| `--allow-missing-external-data` | Zero-fill external tensors whose data file is absent (weight-stripped skeleton models) |
 | `--experimental-dynamic-inputs` | Preserve unresolved symbolic dims as dynamic metadata |
 | `--debug` | Verbose conversion logging (global) |
 
 On success the CLI prints `✓ ORT graph build succeeded for …`.
+
+## Model sweep
+
+`tests/models/manifest.json` lists the transformers.js exports the converter is expected to handle,
+with their dimension overrides and pinned inputs; `tests/model_skeletons.rs` converts each entry and
+builds it in ORT. No weights are downloaded: the test reads each export from the Hugging Face Hub with
+HTTP range requests, keeps the graph and small constants, and points every large initializer at a file
+that does not exist, which the converter zero-fills. A 1.4 GB export becomes a ~0.2 MB skeleton for
+~10 MB of traffic. Skeletons are kept in `target/model-skeletons` (or `O2W_SKELETON_CACHE`), about
+40 MB for the whole manifest, and CI caches that directory keyed on the manifest and scanner source.
+
+`O2W_MODELS` selects the source: `hub` (the default when `CI` is set), `dir=<path>` for full local
+downloads laid out as `<org>--<repo>/onnx/<file>.onnx`, or `strip=<path>` to run local files through
+the skeleton scanner. Unset outside CI, the sweep is skipped. `O2W_MODEL_FETCH_JOBS` (default 8) sets
+how many skeletons are fetched at once, `O2W_MODEL_TEST_JOBS` (default 4) how many convert at once,
+and `O2W_MODEL_TEST_SKIP_HEAVY` skips the entries that need more than 10 GB of RAM.
+
+```powershell
+$env:O2W_MODELS = "dir=..\transformers_js_experiments\models"; cargo test --release --test model_skeletons
+```
 
 Library API:
 

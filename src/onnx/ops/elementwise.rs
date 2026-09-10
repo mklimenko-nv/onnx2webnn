@@ -95,7 +95,9 @@ impl OpHandler for ElementwiseHandler {
     }
 }
 
-/// ONNX Mod with `fmod=1`: `A - B * floor(A / B)`.
+/// ONNX Mod as `A - B * q(A / B)` where `q` is `floor` for `fmod=0`
+/// (integer/Python semantics, sign follows the divisor) and truncation
+/// (`sign(x) * floor(|x|)`) for `fmod=1` (C fmod, sign follows the dividend).
 fn convert_mod(
     node: &NodeProto,
     b: &mut OnnxBuilder<'_, '_, '_>,
@@ -113,7 +115,7 @@ fn convert_mod(
             fmod = attr.i;
         }
     }
-    if fmod != 1 {
+    if fmod != 0 && fmod != 1 {
         return Err(OnnxError::unsupported_op(
             format!("Mod (fmod={fmod})"),
             node_name.to_string(),
@@ -130,12 +132,43 @@ fn convert_mod(
         .div_with_options(a, b_in, div_opts)
         .map_err(map_op_error)?;
 
-    let floor_label = format!("{output_name}__floor");
-    let floor_opts = OnnxBuilder::labeled_options(&floor_label);
-    let floored = b
-        .builder
-        .floor_with_options(quotient, floor_opts)
-        .map_err(map_op_error)?;
+    let floored = if fmod == 0 {
+        let floor_label = format!("{output_name}__floor");
+        let floor_opts = OnnxBuilder::labeled_options(&floor_label);
+        b.builder
+            .floor_with_options(quotient, floor_opts)
+            .map_err(map_op_error)?
+    } else {
+        // trunc(q) = sign(q) * floor(|q|)
+        let abs = b
+            .builder
+            .abs_with_options(
+                quotient,
+                OnnxBuilder::labeled_options(&format!("{output_name}__absq")),
+            )
+            .map_err(map_op_error)?;
+        let abs_floor = b
+            .builder
+            .floor_with_options(
+                abs,
+                OnnxBuilder::labeled_options(&format!("{output_name}__floorq")),
+            )
+            .map_err(map_op_error)?;
+        let sign = b
+            .builder
+            .sign_with_options(
+                quotient,
+                OnnxBuilder::labeled_options(&format!("{output_name}__signq")),
+            )
+            .map_err(map_op_error)?;
+        b.builder
+            .mul_with_options(
+                sign,
+                abs_floor,
+                OnnxBuilder::labeled_options(&format!("{output_name}__truncq")),
+            )
+            .map_err(map_op_error)?
+    };
 
     let b_operand = b.resolve_operand(&inputs[1])?;
     let mul_label = format!("{output_name}__mul");

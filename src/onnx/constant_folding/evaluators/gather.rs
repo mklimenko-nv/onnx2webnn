@@ -195,7 +195,7 @@ impl GatherEvaluator {
         if let Some(tensor) = ctx.get_constant(data_name) {
             let num_elements: i64 = tensor.shape.iter().product();
             // Threshold: 10K elements
-            // - Typical embedding tables: 50K vocab × 512 dims = 25M+ elements
+            // - Typical embedding tables: 50K vocab x 512 dims = 25M+ elements
             // - Shape tensors: <10 elements
             // - Small lookup tables: <1K elements
             if num_elements > 10000 {
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn test_gather_shape_dimensions() {
         // Test gathering specific dimensions from a shape tensor
-        // This is the common pattern: Shape → Gather
+        // This is the common pattern: Shape -> Gather
 
         // Create context with a shape tensor [2, 128, 384]
         let shape_tensor = TensorProto {

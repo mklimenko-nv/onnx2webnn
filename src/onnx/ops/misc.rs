@@ -103,7 +103,7 @@ impl MiscHandler {
                 &scalar_name,
                 DataType::Float32,
                 &[1],
-                &n_f32.to_le_bytes(),
+                n_f32.to_le_bytes().to_vec(),
             )?;
             let divisor = b.resolve_operand(&scalar_name)?;
             let opts = OnnxBuilder::labeled_options(&output_name);
@@ -163,7 +163,7 @@ impl MiscHandler {
             axis as u32
         };
 
-        // cumulativeProduct via log → cumulativeSum → exp (fixture uses positive floats).
+        // cumulativeProduct via log -> cumulativeSum -> exp (fixture uses positive floats).
         let log_label = format!("{output_name}__log");
         let log_opts = OnnxBuilder::labeled_options(&log_label);
         let log_x = b

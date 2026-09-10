@@ -49,7 +49,7 @@ impl OpHandler for ConversionHandler {
         };
 
         match op_type {
-            "Cast" => self.convert_cast(node, &node_name, b),
+            "Cast" => self.convert_cast(node, &node_name, context, b),
             "CastLike" => self.convert_cast_like(node, &node_name, context, b),
             "Constant" => self.convert_constant(node, &node_name, b),
             "QuantizeLinear" => self.convert_quantize_linear(node, &node_name, context, b),
@@ -65,6 +65,7 @@ impl ConversionHandler {
         &self,
         node: &NodeProto,
         node_name: &str,
+        context: &ConversionContext,
         b: &mut OnnxBuilder<'_, '_, '_>,
     ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.input.as_slice();
@@ -100,7 +101,25 @@ impl ConversionHandler {
 
         let output_name = output_label(node, node_name);
         let input = b.resolve_operand(&inputs[0])?;
-        let target_type = map_onnx_tensor_type(to_type.unwrap() as i32)?;
+        // float64 is lowered to float32 (WebNN has no float64).
+        let mut to_type = to_type.unwrap() as i32;
+        if to_type == crate::protos::onnx::TensorProto_DataType::Double as i32 {
+            to_type = crate::protos::onnx::TensorProto_DataType::Float as i32;
+        }
+        // A cast to the operand's own type is a no-op; ORT rejects some
+        // identity casts, so alias the input instead.
+        let same_type = crate::onnx::convert::map_onnx_data_type(to_type)
+            .ok()
+            .is_some_and(|target| context.value_types.get(inputs[0].as_str()) == Some(&target));
+        if same_type {
+            if let Some(onnx_out) = node.output.first() {
+                record_node_output(b, onnx_out, &output_name, input);
+            } else {
+                b.record_operand(&[&output_name], input);
+            }
+            return Ok(ConversionResult::default());
+        }
+        let target_type = map_onnx_tensor_type(to_type)?;
         let opts = OnnxBuilder::labeled_options(&output_name);
         let out = b
             .builder
@@ -192,7 +211,7 @@ impl ConversionHandler {
         let data_type = crate::onnx::convert::map_onnx_data_type(tensor.data_type)?;
         let shape: Vec<u32> = tensor.dims.iter().map(|&d| d.max(0) as u32).collect();
         let bytes = tensor_proto_to_bytes(tensor)?;
-        b.register_constant_from_bytes(onnx_out, data_type, &shape, &bytes)?;
+        b.register_constant_from_bytes(onnx_out, data_type, &shape, bytes)?;
         Ok(ConversionResult::default())
     }
 
@@ -431,7 +450,7 @@ fn register_f32_scalar(
     name: &str,
     value: f32,
 ) -> Result<MLOperand, OnnxError> {
-    b.register_constant_from_bytes(name, DataType::Float32, &[], &value.to_le_bytes())?;
+    b.register_constant_from_bytes(name, DataType::Float32, &[], value.to_le_bytes().to_vec())?;
     b.resolve_operand(name)
 }
 

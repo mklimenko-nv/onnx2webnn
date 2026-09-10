@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! ONNX → [`MLGraphBuilder`] bridge (operand map, naming, rustnn error mapping).
+//! ONNX -> [`MLGraphBuilder`] bridge (operand map, naming, rustnn error mapping).
 
 use crate::onnx::convert::{map_onnx_data_type, sanitize_identifier, OnnxError};
 use crate::protos::onnx::{TensorProto, TensorProto_DataType};
@@ -20,15 +20,18 @@ use std::collections::{HashMap, HashSet};
 pub struct OnnxBuilder<'a, 'ctx, 'bld> {
     pub builder: &'a mut MLGraphBuilder<'ctx, 'bld>,
     operands: HashMap<String, MLOperand>,
-    /// Operand ids registered via `input()` — cannot be passed directly to `build()`.
+    /// Operand ids registered via `input()` - cannot be passed directly to `build()`.
     input_operands: HashSet<u32>,
-    /// Operand ids registered via `constant()` — cannot be passed directly to `build()`.
+    /// Operand ids registered via `constant()` - cannot be passed directly to `build()`.
     constant_operands: HashSet<u32>,
     /// Sanitized + raw ONNX names registered as graph inputs.
     input_names: HashSet<String>,
     /// Zero-element optional-input placeholders (e.g. empty `Resize` roi/scales).
     /// These are not materialized as WebNN constants because 0-sized dims are invalid.
     empty_optional_values: HashSet<String>,
+    /// ONNX sequence values (SplitToSequence outputs) -> element count. The
+    /// elements themselves are registered as `{name}__seq{i}` operands.
+    sequences: HashMap<String, usize>,
 }
 
 /// Operand index inside the builder graph (`MLOperand::id` is `pub(crate)` in rustnn).
@@ -51,7 +54,25 @@ impl<'a, 'ctx, 'bld> OnnxBuilder<'a, 'ctx, 'bld> {
             constant_operands: HashSet::new(),
             input_names: HashSet::new(),
             empty_optional_values: HashSet::new(),
+            sequences: HashMap::new(),
         }
+    }
+
+    /// Name under which sequence element `i` of sequence `name` is registered.
+    pub fn sequence_element_key(name: &str, index: usize) -> String {
+        format!("{}__seq{index}", sanitize_identifier(name))
+    }
+
+    pub fn record_sequence(&mut self, name: &str, count: usize) {
+        self.sequences.insert(name.to_string(), count);
+        self.sequences.insert(sanitize_identifier(name), count);
+    }
+
+    pub fn sequence_element_count(&self, name: &str) -> Option<usize> {
+        self.sequences
+            .get(name)
+            .or_else(|| self.sequences.get(&sanitize_identifier(name)))
+            .copied()
     }
 
     pub fn webnn_id(onnx_name: &str) -> String {
@@ -138,7 +159,7 @@ impl<'a, 'ctx, 'bld> OnnxBuilder<'a, 'ctx, 'bld> {
 
     /// Resolve an ONNX graph output for `build()`.
     ///
-    /// WebNN rejects graph outputs that are still inputs or constants (see § 8.9.4 `build()`).
+    /// WebNN rejects graph outputs that are still inputs or constants (see section 8.9.4 `build()`).
     /// Insert `identity` only for those cases; regular op outputs already have graph-safe names.
     pub fn output_operand(&mut self, name: &str) -> Result<MLOperand, OnnxError> {
         let op = self.resolve_operand(name)?;
@@ -168,46 +189,38 @@ impl<'a, 'ctx, 'bld> OnnxBuilder<'a, 'ctx, 'bld> {
         }
     }
 
+    /// Register a constant, handing the byte buffer to rustnn without a copy.
+    /// Weight tensors reach hundreds of MB and the buffer stays alive for the
+    /// whole backend compile, so every avoided copy matters. rustnn stores
+    /// plain little-endian bytes, so no typed round-trip is needed.
     pub fn register_constant_from_bytes(
         &mut self,
         name: &str,
         data_type: DataType,
         shape: &[u32],
-        bytes: &[u8],
+        bytes: Vec<u8>,
     ) -> Result<(), OnnxError> {
         let id = Self::webnn_id(name);
         let desc = descriptor_static(data_type, shape)?;
-        let op = match data_type {
-            DataType::Float32 => self.builder.constant_from_slice(
-                &desc,
-                bytemuck::try_cast_slice::<_, f32>(bytes)
-                    .map_err(|e| OnnxError::InvalidShape(e.to_string()))?,
-            ),
-            DataType::Float16 => self.builder.constant_from_slice(
-                &desc,
-                bytemuck::try_cast_slice::<_, u16>(bytes)
-                    .map_err(|e| OnnxError::InvalidShape(e.to_string()))?,
-            ),
-            DataType::Int32 => self.builder.constant_from_slice(
-                &desc,
-                bytemuck::try_cast_slice::<_, i32>(bytes)
-                    .map_err(|e| OnnxError::InvalidShape(e.to_string()))?,
-            ),
-            DataType::Int64 => self.builder.constant_from_slice(
-                &desc,
-                bytemuck::try_cast_slice::<_, i64>(bytes)
-                    .map_err(|e| OnnxError::InvalidShape(e.to_string()))?,
-            ),
-            DataType::Uint8 | DataType::Int8 | DataType::Uint4 | DataType::Int4 => {
-                self.builder.constant_from_slice(&desc, bytes)
-            }
+        match data_type {
+            DataType::Float32
+            | DataType::Float16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Uint8
+            | DataType::Int8
+            | DataType::Uint4
+            | DataType::Int4 => {}
             other => {
                 return Err(OnnxError::InvalidShape(format!(
                     "unsupported constant data type for builder: {other:?}"
                 )));
             }
         }
-        .map_err(map_rustnn_error)?;
+        let op = self
+            .builder
+            .constant_from_bytes(&desc, bytes)
+            .map_err(map_rustnn_error)?;
         self.constant_operands.insert(operand_index(op));
         self.record_operand(&[name, &id], op);
         Ok(())
@@ -223,6 +236,7 @@ impl<'a, 'ctx, 'bld> OnnxBuilder<'a, 'ctx, 'bld> {
         &mut self,
         outputs: HashMap<&str, MLOperand>,
     ) -> Result<MLGraph<'ctx>, OnnxError> {
+        let outputs: std::collections::BTreeMap<&str, MLOperand> = outputs.into_iter().collect();
         self.builder.build(&outputs).map_err(map_rustnn_error)
     }
 }
@@ -297,6 +311,22 @@ pub fn tensor_element_count(tensor: &TensorProto) -> usize {
 
 /// Extract initializer / constant tensor bytes for `constant_from_slice`.
 pub fn tensor_proto_to_bytes(tensor: &TensorProto) -> Result<Vec<u8>, OnnxError> {
+    if tensor.data_type == TensorProto_DataType::Double as i32 {
+        // float64 is lowered to float32 (WebNN has no float64).
+        let values: Vec<f64> = if !tensor.raw_data.is_empty() {
+            tensor
+                .raw_data
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .collect()
+        } else {
+            tensor.double_data.clone()
+        };
+        return Ok(values
+            .iter()
+            .flat_map(|&v| (v as f32).to_le_bytes())
+            .collect());
+    }
     if !tensor.raw_data.is_empty() {
         return Ok(tensor.raw_data.clone());
     }
