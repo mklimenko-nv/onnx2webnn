@@ -10,14 +10,6 @@ env:
   # ONNX Runtime dylib for the reference backend. rustnn pins ort 2.0.0-rc.13
   # with the `api-27` feature, so this must be >= 1.27 (any newer 1.x works).
   ORT_VERSION: 1.29.0
-  # rustnn checkout. Pinned to the fork branch carrying (a) the ONNX exporter
-  # fixes (Squeeze axes, f16 casts, bidirectional LSTM/GRU) and (b) the CoreML
-  # fixes the macOS --release + --features coreml job requires (ARC
-  # __bridge_retained ownership in compile/load/predict, converter gaps).
-  # Do not switch back to rustnn/rustnn @ main until BOTH have landed upstream
-  # (rustnn/rustnn#219).
-  RUSTNN_REPO: mklimenko-nv/rustnn
-  RUSTNN_REF: private/mklimenko/onnx2webnn-fixes
 
 jobs:
   test:
@@ -77,8 +69,7 @@ jobs:
         id: rustnn
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.RUSTNN_REPO }}
-          ref: ${{ env.RUSTNN_REF }}
+          repository: rustnn/rustnn
           path: rustnn
 
       - name: Install Rust
