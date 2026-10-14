@@ -393,7 +393,7 @@ impl ConvHandler {
         };
         let conv = b
             .builder
-            .conv2_with_options(
+            .conv2d_with_options(
                 input,
                 filter,
                 build_conv2d_options(&attrs, &format!("{output_name}_conv2d"))?,
@@ -631,7 +631,7 @@ impl ConvHandler {
             let mut opts = build_conv2d_options(attrs, &conv_label)?;
             opts.bias = optional_operand_index(b, bias_raw)?;
             b.builder
-                .conv2_with_options(input, filter, opts)
+                .conv2d_with_options(input, filter, opts)
                 .map_err(map_op_error)?
         };
 
@@ -726,7 +726,7 @@ impl ConvHandler {
             let mut opts = build_conv2d_options(&attrs_2d, &conv_label)?;
             opts.bias = optional_operand_index(b, bias_raw)?;
             b.builder
-                .conv2_with_options(x4d, w4d, opts)
+                .conv2d_with_options(x4d, w4d, opts)
                 .map_err(map_op_error)?
         };
         b.record_operand(&[&conv_label], conv_out);

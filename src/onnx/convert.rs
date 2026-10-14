@@ -26,7 +26,8 @@ use crate::protos::onnx::{
 use prost::Message;
 use rustnn::graph::{Dimension, DynamicDimension};
 use rustnn::mlcontext::{
-    MLContext, MLContextOptions, MLGraph, MLGraphBuilder, MLOperand, MLPowerPreference,
+    MLContext, MLContextOptions, MLGraph, MLGraphBuilder, MLNamedOperands, MLOperand,
+    MLPowerPreference,
 };
 use rustnn::DataType;
 use serde_json::Value as JsonValue;
@@ -1996,8 +1997,7 @@ pub(crate) fn convert_model(
             .rustnn_save_webnn(&output_refs, path)
             .map_err(map_rustnn_error)?;
     }
-    let output_refs: HashMap<&str, MLOperand> =
-        outputs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    let output_refs: MLNamedOperands = outputs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
 
     let graph = onnx_builder.finish_build(output_refs)?;
 

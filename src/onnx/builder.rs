@@ -11,7 +11,7 @@ use crate::protos::onnx::{TensorProto, TensorProto_DataType};
 use rustnn::error::{Error as RustnnError, GraphBuilderError};
 use rustnn::graph::Dimension;
 use rustnn::mlcontext::MLOperandDescriptor;
-use rustnn::mlcontext::{MLGraph, MLGraphBuilder, MLOperand};
+use rustnn::mlcontext::{MLGraph, MLGraphBuilder, MLNamedOperands, MLOperand};
 use rustnn::operator_enums::MLOperandDataType;
 use rustnn::operator_options::MLOperatorOptions;
 use rustnn::DataType;
@@ -232,10 +232,7 @@ impl<'a, 'ctx, 'bld> OnnxBuilder<'a, 'ctx, 'bld> {
         }
     }
 
-    pub fn finish_build(
-        &mut self,
-        outputs: HashMap<&str, MLOperand>,
-    ) -> Result<MLGraph<'ctx>, OnnxError> {
+    pub fn finish_build(&mut self, outputs: MLNamedOperands) -> Result<MLGraph<'ctx>, OnnxError> {
         let outputs: std::collections::BTreeMap<&str, MLOperand> = outputs.into_iter().collect();
         self.builder.build(&outputs).map_err(map_rustnn_error)
     }
